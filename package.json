@@ -1,0 +1,23 @@
+{
+  "name": "@apocaliss92/wyze-bridge-js",
+  "version": "0.1.0",
+  "description": "Wyze camera local P2P streaming bridge — Node.js port of go2rtc/pkg/wyze",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/apocaliss92/wyze-bridge-js"
+  },
+  "author": "@apocaliss92",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  }
+}
