@@ -39,11 +39,11 @@ for (const cam of cameras) {
 import { WyzeDTLSConn } from "@apocaliss92/wyze-bridge-js";
 
 const conn = new WyzeDTLSConn({
-  host: "192.168.1.41",
-  uid: "3Y5N8XHM...",
-  enr: "ZWsncOqw...",
-  mac: "80482C53405B",
-  model: "WYZE_CAKP2JFUS",
+  host: "192.168.1.100",
+  uid: "ABCD1234EFGH5678IJKL",
+  enr: "aB1cD2eF3gH4iJ5k",
+  mac: "AABBCCDDEEFF",
+  model: "WYZE_CAMV3",
 });
 
 await conn.connect();
