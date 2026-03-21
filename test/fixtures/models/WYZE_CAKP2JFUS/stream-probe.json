@@ -1,0 +1,12 @@
+{
+  "videoCodec": "H264",
+  "audioCodec": "0x8c",
+  "firstKeyframeSize": 47568,
+  "framesIn5s": {
+    "video": 102,
+    "audio": 118
+  },
+  "audioSampleRate": 8000,
+  "audioChannels": 1,
+  "estimatedFps": 20
+}

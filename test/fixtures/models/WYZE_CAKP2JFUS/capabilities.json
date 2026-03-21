@@ -1,0 +1,8 @@
+{
+  "hasSpotlight": true,
+  "hasSiren": true,
+  "hasFloodlight": false,
+  "hasAccessories": true,
+  "hasRtsp": false,
+  "hasBattery": false
+}

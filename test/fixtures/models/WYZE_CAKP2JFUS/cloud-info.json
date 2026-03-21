@@ -1,0 +1,12 @@
+{
+  "mac": "80:48:2C:53:40:5B",
+  "p2pId": "x.x.x.x",
+  "enr": "***ENR***",
+  "ip": "x.x.x.x",
+  "nickname": "Test",
+  "productModel": "WYZE_CAKP2JFUS",
+  "productType": "Camera",
+  "dtls": 1,
+  "firmwareVer": "4.36.14.3497",
+  "isOnline": true
+}

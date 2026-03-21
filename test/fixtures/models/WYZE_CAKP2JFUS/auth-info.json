@@ -1,0 +1,57 @@
+{
+  "connectionRes": "1",
+  "cameraInfo": {
+    "videoParm": {
+      "type": "H264",
+      "bitRate": "30",
+      "resolution": "2",
+      "fps": "20",
+      "horizontalFlip": "1",
+      "verticalFlip": "1",
+      "logo": "1",
+      "time": "1"
+    },
+    "settingParm": {
+      "stateVision": "1",
+      "nightVision": "3",
+      "osd": "1",
+      "logSd": "1",
+      "logUdisk": "1",
+      "telnet": "2",
+      "tz": "1"
+    },
+    "basicInfo": {
+      "firmware": "4.36.14.3497",
+      "type": "camera",
+      "hardware": "0.0.0.0",
+      "model": "WYZE_CAKP2JFUS",
+      "mac": "80:48:2C:53:40:5B",
+      "wifidb": "70"
+    },
+    "channelResquestResult": {
+      "video": "1",
+      "audio": "1"
+    },
+    "recordType": {
+      "type": "1"
+    },
+    "sdParm": {
+      "status": "2",
+      "capacity": "0",
+      "free": "0",
+      "detail": "0"
+    },
+    "uDiskParm": {
+      "status": "2",
+      "capacity": "0",
+      "free": "0"
+    },
+    "apartalarmParm": {
+      "type": "0",
+      "startX": "25",
+      "longX": "50",
+      "startY": "25",
+      "heightY": "50"
+    }
+  }
+}
