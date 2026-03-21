@@ -213,6 +213,418 @@ export class WyzeDTLSConn extends EventEmitter {
     this.frameHandler.setHandler(handler);
   }
 
+  // ─── Camera Commands (K10xxx via HL protocol) ─────────────────
+
+  /**
+   * Send a raw HL command and optionally wait for a response.
+   * @returns The response payload, or null if no response expected.
+   */
+  async sendHLCommand(cmdId: number, payload: Buffer = Buffer.alloc(0), expectResponseCmd?: number): Promise<Buffer | null> {
+    const hlMsg = this.buildHL(cmdId, payload);
+    if (expectResponseCmd !== undefined) {
+      return this.sendIOCtrlWait(hlMsg, expectResponseCmd);
+    }
+    // Fire and forget
+    const frame = this.msgIOCtrl(hlMsg);
+    await this.udpSend(this.msgTxData(this.dtlsWrite(23, frame), 0));
+    return null;
+  }
+
+  /** Get night vision status. Returns 1=on, 2=off, 3=auto */
+  async getNightVision(): Promise<number> {
+    const resp = await this.sendHLCommand(10040, Buffer.alloc(0), 10041);
+    return resp?.[0] ?? 0;
+  }
+
+  /** Set night vision. 1=on, 2=off, 3=auto */
+  async setNightVision(mode: 1 | 2 | 3): Promise<void> {
+    await this.sendHLCommand(10042, Buffer.from([mode]), 10043);
+  }
+
+  /** Get motion alarm status. Returns: { enabled: boolean, sensitivity: number } */
+  async getMotionAlarm(): Promise<{ enabled: boolean; sensitivity: number }> {
+    const resp = await this.sendHLCommand(10200, Buffer.alloc(0), 10201);
+    if (!resp || resp.length < 2) return { enabled: false, sensitivity: 0 };
+    return { enabled: resp[0] === 1, sensitivity: resp[1]! };
+  }
+
+  /** Set motion alarm. sensitivity: 1=low, 2=medium, 3=high */
+  async setMotionAlarm(enabled: boolean, sensitivity: 1 | 2 | 3 = 2): Promise<void> {
+    await this.sendHLCommand(10202, Buffer.from([enabled ? 1 : 2, sensitivity]), 10203);
+  }
+
+  /** Get status LED (network light). Returns true if on. */
+  async getStatusLight(): Promise<boolean> {
+    const resp = await this.sendHLCommand(10030, Buffer.alloc(0), 10031);
+    return resp?.[0] === 1;
+  }
+
+  /** Set status LED on/off. */
+  async setStatusLight(on: boolean): Promise<void> {
+    await this.sendHLCommand(10032, Buffer.from([on ? 1 : 2]), 10033);
+  }
+
+  /** Take a photo on the camera (saved to SD card). */
+  async takePhoto(): Promise<void> {
+    await this.sendHLCommand(10058, Buffer.from([1]));
+  }
+
+  /** Start the camera's built-in boa web server (for accessing photos on SD). */
+  async startBoaServer(): Promise<void> {
+    await this.sendHLCommand(10148, Buffer.from([0, 1, 0, 0, 0]));
+  }
+
+  /** Get IR LED status. Returns true if on. */
+  async getIRLED(): Promise<boolean> {
+    const resp = await this.sendHLCommand(10044, Buffer.alloc(0), 10045);
+    return resp?.[0] === 1;
+  }
+
+  /** Set IR LED on/off. */
+  async setIRLED(on: boolean): Promise<void> {
+    await this.sendHLCommand(10046, Buffer.from([on ? 1 : 2]), 10047);
+  }
+
+  /** Get motion tagging (green box) status. */
+  async getMotionTagging(): Promise<boolean> {
+    const resp = await this.sendHLCommand(10290, Buffer.alloc(0), 10291);
+    return resp?.[0] === 1;
+  }
+
+  /** Set motion tagging (green box) on/off. */
+  async setMotionTagging(on: boolean): Promise<void> {
+    await this.sendHLCommand(10292, Buffer.from([on ? 1 : 2]), 10293);
+  }
+
+  /** Get camera time. */
+  async getCameraTime(): Promise<number> {
+    const resp = await this.sendHLCommand(10090, Buffer.alloc(0), 10091);
+    if (!resp || resp.length < 4) return 0;
+    return resp.readUInt32LE(0);
+  }
+
+  /** Get spotlight/floodlight status. Returns true if on. */
+  async getSpotlight(): Promise<boolean> {
+    const resp = await this.sendHLCommand(10640, Buffer.alloc(0), 10641);
+    return resp?.[0] === 1;
+  }
+
+  /** Set spotlight/floodlight on/off. */
+  async setSpotlight(on: boolean): Promise<void> {
+    await this.sendHLCommand(10646, Buffer.from([on ? 1 : 2]), 10647);
+  }
+
+  /** Get alarm flashing status (siren + flash). */
+  async getAlarmFlashing(): Promise<boolean> {
+    const resp = await this.sendHLCommand(10632, Buffer.alloc(0), 10633);
+    return resp?.[0] === 1;
+  }
+
+  /** Set alarm flashing (siren + flash) on/off. K10630: value 1=on, 2=off. */
+  async setAlarmFlashing(on: boolean): Promise<void> {
+    const v = on ? 1 : 2;
+    await this.sendHLCommand(10630, Buffer.from([v, v]), 10631);
+  }
+
+  /** Trigger siren + flash alarm (turn on). */
+  async triggerAlarm(): Promise<void> { return this.setAlarmFlashing(true); }
+
+  /** Stop siren + flash alarm (turn off). */
+  async stopAlarm(): Promise<void> { return this.setAlarmFlashing(false); }
+
+  /** Set floodlight switch (for integrated floodlight cameras). K12060. */
+  async setFloodlight(on: boolean): Promise<void> {
+    await this.sendHLCommand(12060, Buffer.from([on ? 1 : 2]));
+  }
+
+  /**
+   * Query camera capabilities by probing commands.
+   * Returns which accessories/features are available.
+   */
+  async probeCapabilities(): Promise<{
+    hasSpotlight: boolean;
+    hasSiren: boolean;
+    hasFloodlight: boolean;
+    hasAccessories: boolean;
+    hasRtsp: boolean;
+    hasBattery: boolean;
+  }> {
+    const probe = async (cmdId: number, respCmdId: number): Promise<boolean> => {
+      try { const r = await this.sendHLCommand(cmdId, Buffer.alloc(0), respCmdId); return r !== null && r.length > 0; }
+      catch { return false; }
+    };
+
+    const [hasSpotlight, hasSiren, hasFloodlight, hasAccessories, hasRtsp, hasBattery] = await Promise.all([
+      probe(10640, 10641), // spotlight
+      probe(10632, 10633), // alarm/siren
+      probe(10788, 10789), // integrated floodlight
+      probe(10720, 10721), // accessories
+      probe(10604, 10605), // rtsp
+      probe(10448, 10449), // battery
+    ]);
+
+    return { hasSpotlight, hasSiren, hasFloodlight, hasAccessories, hasRtsp, hasBattery };
+  }
+
+  /**
+   * Waits for the next keyframe and returns the raw H264 Annex-B data.
+   * Use ffmpeg to decode: `ffmpeg -f h264 -i pipe:0 -frames:v 1 -f image2 snapshot.jpg`
+   */
+  grabKeyframe(timeoutMs = 10000): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { cleanup(); reject(new Error("Keyframe timeout")); }, timeoutMs);
+      const origHandler = (this.frameHandler as any).onPacket;
+
+      const handler = (pkt: Packet) => {
+        origHandler?.(pkt);
+        if (isVideoCodec(pkt.codec) && pkt.isKeyframe) {
+          cleanup();
+          resolve(pkt.payload);
+        }
+      };
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.frameHandler.setHandler(origHandler ?? (() => {}));
+      };
+
+      this.frameHandler.setHandler(handler);
+    });
+  }
+
+  // ─── Diagnostics ──────────────────────────────────────────────
+
+  /**
+   * Run full diagnostics: query every known camera parameter/flag and
+   * return a JSON-serialisable object. Useful for debugging and
+   * understanding a camera's capabilities.
+   *
+   * Commands that the camera does not support will return `null` with
+   * an error message. The function never throws.
+   */
+
+  // ─── Boa SD Card Polling (local motion detection) ─────────────
+
+  /**
+   * Check if the camera's built-in HTTP server (boa) is reachable.
+   * Boa serves files from the SD card — requires SD card inserted.
+   */
+  async isBoaAlive(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const s = new (require("node:net").Socket)();
+      s.setTimeout(2000);
+      s.connect(80, this.host, () => { s.destroy(); resolve(true); });
+      s.on("error", () => resolve(false));
+      s.on("timeout", () => { s.destroy(); resolve(false); });
+    });
+  }
+
+  /**
+   * Start boa and begin polling for alarm images (local motion detection).
+   * Emits "motion" events when new alarm images appear on the SD card.
+   *
+   * @param intervalMs - Polling interval in ms (default: 3000)
+   * @returns A stop function, or null if boa is not available
+   */
+  async startBoaMotionPolling(intervalMs = 3000): Promise<{ stop: () => void } | null> {
+    // Try to start boa
+    await this.startBoaServer();
+    await new Promise(r => setTimeout(r, 3000));
+
+    if (!(await this.isBoaAlive())) {
+      return null; // No boa (no SD card, unsupported firmware, etc.)
+    }
+
+    let lastAlarmFile: string | null = null;
+    let stopped = false;
+
+    const poll = async () => {
+      if (stopped) return;
+      try {
+        const result = await this.pollBoaAlarm();
+        if (result && result.fileName !== lastAlarmFile) {
+          lastAlarmFile = result.fileName;
+          this.emit("motion", {
+            timestamp: Date.now(),
+            fileName: result.fileName,
+            imageUrl: result.imageUrl,
+            image: result.image, // JPEG Buffer or null
+          });
+        }
+      } catch {}
+    };
+
+    const timer = setInterval(poll, intervalMs);
+    poll(); // Initial check
+
+    return {
+      stop: () => { stopped = true; clearInterval(timer); },
+    };
+  }
+
+  /**
+   * Poll the boa web server for the latest alarm image.
+   * Returns null if no alarm images found or boa not available.
+   */
+  async pollBoaAlarm(): Promise<{ fileName: string; imageUrl: string; image: Buffer | null } | null> {
+    try {
+      const base = `http://${this.host}/cgi-bin/hello.cgi?name=/alarm/`;
+      const dateResp = await fetch(base, { signal: AbortSignal.timeout(3000) });
+      const dateHtml = await dateResp.text();
+
+      // Parse date folders: <h2>20260321</h2>
+      const dates = [...dateHtml.matchAll(/<h2>(\d+)<\/h2>/g)].map(m => m[1]!);
+      if (dates.length === 0) return null;
+      const latestDate = dates.sort().pop()!;
+
+      // Get files in latest date folder
+      const fileResp = await fetch(`${base}${latestDate}`, { signal: AbortSignal.timeout(3000) });
+      const fileHtml = await fileResp.text();
+
+      // Parse file names: <h1>20260321_12_30_45.jpg</h1>
+      const files = [...fileHtml.matchAll(/<h1>(\w+\.jpg)<\/h1>/g)].map(m => m[1]!);
+      if (files.length === 0) return null;
+      const latestFile = files.sort().pop()!;
+
+      const imageUrl = `http://${this.host}/SDPath/alarm/${latestDate}/${latestFile}`;
+
+      // Download the image
+      let image: Buffer | null = null;
+      try {
+        const imgResp = await fetch(imageUrl, { signal: AbortSignal.timeout(5000) });
+        if (imgResp.ok) {
+          image = Buffer.from(await imgResp.arrayBuffer());
+        }
+      } catch {}
+
+      return { fileName: latestFile, imageUrl, image };
+    } catch {
+      return null;
+    }
+  }
+  async runDiagnostics(): Promise<Record<string, unknown>> {
+    const diag: Record<string, unknown> = {
+      _timestamp: new Date().toISOString(),
+      _host: this.host,
+      _model: this.model,
+      _uid: this.uid,
+      _mac: this.mac,
+    };
+
+    const safeQuery = async (
+      label: string,
+      cmdId: number,
+      responseCmdId: number,
+      payload: Buffer = Buffer.alloc(0),
+      parser?: (buf: Buffer) => unknown,
+    ) => {
+      try {
+        const resp = await this.sendHLCommand(cmdId, payload, responseCmdId);
+        if (!resp || resp.length === 0) { diag[label] = null; return; }
+        if (parser) { diag[label] = parser(resp); return; }
+        // Default: try JSON first, then hex dump
+        const str = resp.toString().replace(/[\x00-\x1f]/g, "").trim();
+        const jsonStart = str.indexOf("{");
+        if (jsonStart >= 0) {
+          try { diag[label] = JSON.parse(str.slice(jsonStart)); return; } catch {}
+        }
+        diag[label] = { raw: resp.toString("hex"), length: resp.length };
+      } catch (e: any) {
+        diag[label] = { error: e?.message ?? String(e) };
+      }
+    };
+
+    const parseBool = (b: Buffer) => b[0] === 1;
+    const parseOnOff = (b: Buffer) => ({ value: b[0], label: b[0] === 1 ? "on" : b[0] === 2 ? "off" : b[0] === 3 ? "auto" : `unknown(${b[0]})` });
+
+    // K10020 — Camera Info (JSON) — the big one
+    // Sends param count + param IDs 1..60
+    const paramCount = 60;
+    const k10020Payload = Buffer.alloc(1 + paramCount);
+    k10020Payload[0] = paramCount;
+    for (let i = 0; i < paramCount; i++) k10020Payload[i + 1] = i + 1;
+    await safeQuery("cameraInfo", 10020, 10021, k10020Payload);
+
+    // K10030 — Network/Status LED
+    await safeQuery("statusLight", 10030, 10031, Buffer.alloc(0), parseOnOff);
+
+    // K10040 — Night Vision
+    await safeQuery("nightVision", 10040, 10041, Buffer.alloc(0), parseOnOff);
+
+    // K10044 — IR LED
+    await safeQuery("irLed", 10044, 10045, Buffer.alloc(0), parseOnOff);
+
+    // K10050 — Video Parameters (bitrate, resolution, fps, flip)
+    await safeQuery("videoParams", 10050, 10051, Buffer.alloc(0), (b) => {
+      if (b.length < 5) return { raw: b.toString("hex") };
+      return {
+        bitrate: b.readUInt16LE(0),
+        resolution: b[2],
+        fps: b[3],
+        horizontalFlip: b[4] === 1,
+        verticalFlip: b.length > 5 ? b[5] === 1 : undefined,
+      };
+    });
+
+    // K10070 — OSD (On-Screen Display / timestamp)
+    await safeQuery("osd", 10070, 10071, Buffer.alloc(0), parseOnOff);
+
+    // K10074 — OSD Logo
+    await safeQuery("osdLogo", 10074, 10075, Buffer.alloc(0), parseOnOff);
+
+    // K10090 — Camera Time
+    await safeQuery("cameraTime", 10090, 10091, Buffer.alloc(0), (b) => {
+      if (b.length < 4) return null;
+      const ts = b.readUInt32LE(0);
+      return { unixTimestamp: ts, date: new Date(ts * 1000).toISOString() };
+    });
+
+    // K10200 — Motion Alarm
+    await safeQuery("motionAlarm", 10200, 10201, Buffer.alloc(0), (b) => {
+      if (b.length < 1) return null;
+      return {
+        enabled: b[0] === 1,
+        sensitivity: b.length >= 2 ? b[1] : undefined,
+        sensitivityLabel: b.length >= 2 ? (b[1] === 1 ? "low" : b[1] === 2 ? "medium" : b[1] === 3 ? "high" : `unknown(${b[1]})`) : undefined,
+      };
+    });
+
+    // K10290 — Motion Tagging (green box)
+    await safeQuery("motionTagging", 10290, 10291, Buffer.alloc(0), parseBool);
+
+    // K10446 — Connection Status (JSON, outdoor cams)
+    await safeQuery("connectionStatus", 10446, 10447);
+
+    // K10448 — Battery Usage (outdoor cams, JSON)
+    await safeQuery("batteryUsage", 10448, 10449);
+
+    // K10604 — RTSP Parameters
+    await safeQuery("rtspParams", 10604, 10605);
+
+    // K10620 — Night check
+    await safeQuery("nightCheck", 10620, 10621);
+
+    // K10624 — Auto Switch Night Type
+    await safeQuery("autoSwitchNightType", 10624, 10625, Buffer.alloc(0), parseOnOff);
+
+    // K10632 — Alarm Flashing
+    await safeQuery("alarmFlashing", 10632, 10633, Buffer.alloc(0), parseOnOff);
+
+    // K10640 — Spotlight
+    await safeQuery("spotlight", 10640, 10641, Buffer.alloc(0), parseOnOff);
+
+    // K10720 — Accessories Info (JSON)
+    await safeQuery("accessoriesInfo", 10720, 10721);
+
+    // K10788 — Integrated Floodlight Info
+    await safeQuery("integratedFloodlightInfo", 10788, 10789);
+
+    // K10820 — White Light Info
+    await safeQuery("whiteLightInfo", 10820, 10821);
+
+    return diag;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;

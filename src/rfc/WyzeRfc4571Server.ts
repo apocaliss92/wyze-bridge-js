@@ -157,6 +157,8 @@ export interface WyzeRfc4571Server {
   port: number;
   sdp: string;
   videoType: VideoType;
+  /** The underlying P2P connection — use for camera commands, snapshots, etc. */
+  connection: import("../tutk/dtls/WyzeDTLSConn.js").WyzeDTLSConn;
   close: () => Promise<void>;
 }
 
@@ -291,6 +293,7 @@ export async function createWyzeRfc4571Server(
     port: addr.port,
     sdp,
     videoType,
+    connection: conn,
     close: closeFn,
   };
 }
