@@ -268,6 +268,7 @@ export async function createWyzeRfc4571Server(
     mac: camera.mac,
     model: camera.productModel,
     verbose,
+    logger,
   });
 
   logger.log?.(`[wyze-rfc4571] Connecting to ${camera.nickname} (${camera.ip})...`);

@@ -22,6 +22,8 @@ export interface WyzeDTLSConnOptions {
   mac: string;
   model: string;
   verbose?: boolean;
+  /** Optional logger — defaults to global console. Pass Scrypted's console to see logs in the plugin UI. */
+  logger?: { log: (...args: any[]) => void; error?: (...args: any[]) => void };
 }
 
 interface DtlsRecord { contentType: number; epoch: number; seqNum: number; fragment: Buffer; totalLen: number; }
@@ -106,6 +108,7 @@ export class WyzeDTLSConn extends EventEmitter {
   private readonly psk: Buffer;
   private readonly sid: Buffer;
   private readonly verbose: boolean;
+  private readonly log: (...args: any[]) => void;
 
   // DTLS keys
   private clientWriteKey!: Buffer;
@@ -141,6 +144,7 @@ export class WyzeDTLSConn extends EventEmitter {
     this.mac = opts.mac;
     this.model = opts.model;
     this.verbose = opts.verbose ?? false;
+    this.log = opts.logger?.log?.bind(opts.logger) ?? console.log;
     this.authKey = calculateAuthKey(opts.enr, opts.mac).toString("ascii");
     this.psk = derivePSK(opts.enr);
     this.sid = genSessionId();
@@ -156,11 +160,11 @@ export class WyzeDTLSConn extends EventEmitter {
   async connect(): Promise<{ hasTwoWay: boolean; authInfo: any }> {
     this.socket = dgram.createSocket("udp4");
     await new Promise<void>(r => this.socket!.bind(0, r));
-    if (this.verbose) console.log(`[Wyze] UDP bound :${this.socket.address().port}`);
+    if (this.verbose) this.log(`[Wyze] UDP bound :${this.socket.address().port}`);
 
     // 1. IOTC Discovery
     await this.writeAndWait(this.msgDisco(1), r => r.length >= 16 && r.readUInt16LE(8) === 0x0602);
-    if (this.verbose) console.log("[Wyze] Discovery OK");
+    if (this.verbose) this.log("[Wyze] Discovery OK");
 
     // 2. Direct connect
     await this.udpSend(this.msgDisco(2));
@@ -168,22 +172,22 @@ export class WyzeDTLSConn extends EventEmitter {
 
     // 3. Session
     await this.writeAndWait(this.msgSession(), r => r.length >= 16 && r.readUInt16LE(8) === 0x0404);
-    if (this.verbose) console.log("[Wyze] Session OK");
+    if (this.verbose) this.log("[Wyze] Session OK");
 
     // 4. DTLS Handshake
     await this.doDTLSHandshake();
-    if (this.verbose) console.log("[Wyze] DTLS OK");
+    if (this.verbose) this.log("[Wyze] DTLS OK");
 
     // 5. AV Login
     const hasTwoWay = await this.doAVLogin();
-    if (this.verbose) console.log(`[Wyze] AV Login OK (twoWay=${hasTwoWay})`);
+    if (this.verbose) this.log(`[Wyze] AV Login OK (twoWay=${hasTwoWay})`);
 
     // Start periodic ACK
     this.ackTicker = setInterval(() => this.sendPeriodicAck(), 100);
 
     // 6. K-Auth
     const authInfo = await this.doKAuth();
-    if (this.verbose) console.log("[Wyze] K-Auth OK");
+    if (this.verbose) this.log("[Wyze] K-Auth OK");
 
     // Start frame listener
     this.startFrameListener();
@@ -220,22 +224,22 @@ export class WyzeDTLSConn extends EventEmitter {
    * @returns The response payload, or null if no response expected.
    */
   async sendHLCommand(cmdId: number, payload: Buffer = Buffer.alloc(0), expectResponseCmd?: number): Promise<Buffer | null> {
-    console.log(`[Wyze-HL] K${cmdId} → payload=[${[...payload].map(b => "0x" + b.toString(16)).join(",")}]${expectResponseCmd ? ` waitFor=K${expectResponseCmd}` : " (fire-and-forget)"}`);
+    this.log(`[Wyze-HL] K${cmdId} → payload=[${[...payload].map(b => "0x" + b.toString(16)).join(",")}]${expectResponseCmd ? ` waitFor=K${expectResponseCmd}` : " (fire-and-forget)"}`);
     const hlMsg = this.buildHL(cmdId, payload);
     if (expectResponseCmd !== undefined) {
       try {
         const resp = await this.sendIOCtrlWait(hlMsg, expectResponseCmd);
-        console.log(`[Wyze-HL] K${cmdId} → K${expectResponseCmd} OK resp=[${[...resp].map(b => "0x" + b.toString(16)).join(",")}] (${resp.length}B)`);
+        this.log(`[Wyze-HL] K${cmdId} → K${expectResponseCmd} OK resp=[${[...resp].map(b => "0x" + b.toString(16)).join(",")}] (${resp.length}B)`);
         return resp;
       } catch (e: any) {
-        console.log(`[Wyze-HL] K${cmdId} → K${expectResponseCmd} FAILED: ${e?.message}`);
+        this.log(`[Wyze-HL] K${cmdId} → K${expectResponseCmd} FAILED: ${e?.message}`);
         throw e;
       }
     }
     // Fire and forget
     const frame = this.msgIOCtrl(hlMsg);
     await this.udpSend(this.msgTxData(this.dtlsWrite(23, frame), 0));
-    console.log(`[Wyze-HL] K${cmdId} sent (no response expected)`);
+    this.log(`[Wyze-HL] K${cmdId} sent (no response expected)`);
     return null;
   }
 
