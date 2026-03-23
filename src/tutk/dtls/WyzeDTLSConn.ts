@@ -220,13 +220,22 @@ export class WyzeDTLSConn extends EventEmitter {
    * @returns The response payload, or null if no response expected.
    */
   async sendHLCommand(cmdId: number, payload: Buffer = Buffer.alloc(0), expectResponseCmd?: number): Promise<Buffer | null> {
+    console.log(`[Wyze-HL] K${cmdId} → payload=[${[...payload].map(b => "0x" + b.toString(16)).join(",")}]${expectResponseCmd ? ` waitFor=K${expectResponseCmd}` : " (fire-and-forget)"}`);
     const hlMsg = this.buildHL(cmdId, payload);
     if (expectResponseCmd !== undefined) {
-      return this.sendIOCtrlWait(hlMsg, expectResponseCmd);
+      try {
+        const resp = await this.sendIOCtrlWait(hlMsg, expectResponseCmd);
+        console.log(`[Wyze-HL] K${cmdId} → K${expectResponseCmd} OK resp=[${[...resp].map(b => "0x" + b.toString(16)).join(",")}] (${resp.length}B)`);
+        return resp;
+      } catch (e: any) {
+        console.log(`[Wyze-HL] K${cmdId} → K${expectResponseCmd} FAILED: ${e?.message}`);
+        throw e;
+      }
     }
     // Fire and forget
     const frame = this.msgIOCtrl(hlMsg);
     await this.udpSend(this.msgTxData(this.dtlsWrite(23, frame), 0));
+    console.log(`[Wyze-HL] K${cmdId} sent (no response expected)`);
     return null;
   }
 
