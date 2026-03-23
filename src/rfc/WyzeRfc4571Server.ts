@@ -3,7 +3,7 @@
  *
  * Wraps a WyzeDTLSConn into a TCP server that speaks RFC 4571 framed RTP.
  * Scrypted (or any RFC 4571 consumer) connects via TCP, receives SDP, then
- * gets a packetized H264/H265 + optional audio stream.
+ * gets a packetized H264/H265 + audio stream.
  *
  * Usage:
  *   const server = await createWyzeRfc4571Server({ camera, cloud, logger });
@@ -12,9 +12,8 @@
  */
 
 import * as net from "node:net";
-import { EventEmitter } from "node:events";
 import { WyzeDTLSConn, type WyzeDTLSConnOptions } from "../tutk/dtls/WyzeDTLSConn.js";
-import { isVideoCodec, isAudioCodec, CodecH264, CodecH265 } from "../tutk/codec.js";
+import { isVideoCodec, isAudioCodec, CodecH264, CodecH265, CodecPCMU, CodecPCMA, CodecPCML, CodecAACADTS, CodecAACRaw, CodecAACLATM, CodecAACAlt, CodecOpus } from "../tutk/codec.js";
 import type { Packet } from "../tutk/frame.js";
 import type { WyzeCamera } from "../cloud/types.js";
 
@@ -78,9 +77,47 @@ function extractH265Params(au: Buffer): { vps?: Buffer; sps?: Buffer; pps?: Buff
   return { vps, sps, pps };
 }
 
-function buildSdp(videoType: VideoType, videoPT: number, sps?: Buffer, pps?: Buffer, vps?: Buffer): string {
-  let sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=Wyze\r\nt=0 0\r\n";
-  sdp += `m=video 0 RTP/AVP ${videoPT}\r\nc=IN IP4 0.0.0.0\r\n`;
+// ─── Audio codec → RTP mapping ──────────────────────────────────
+
+interface AudioRtpInfo {
+  payloadType: number;     // RTP payload type (0=PCMU, 8=PCMA, dynamic for others)
+  encodingName: string;    // SDP rtpmap encoding name
+  clockRate: number;       // SDP clock rate
+  channels: number;        // Audio channels
+  fmtp?: string;           // Optional fmtp line
+}
+
+function getAudioRtpInfo(codecId: number, sampleRate: number, channels: number): AudioRtpInfo | null {
+  switch (codecId) {
+    case CodecPCMU:
+      // G.711 mu-law: static PT 0, always 8000Hz/1ch in standard RTP
+      // If camera sends at higher rate, use dynamic PT
+      if (sampleRate === 8000 && channels === 1) {
+        return { payloadType: 0, encodingName: "PCMU", clockRate: 8000, channels: 1 };
+      }
+      return { payloadType: 97, encodingName: "PCMU", clockRate: sampleRate, channels };
+    case CodecPCMA:
+      if (sampleRate === 8000 && channels === 1) {
+        return { payloadType: 8, encodingName: "PCMA", clockRate: 8000, channels: 1 };
+      }
+      return { payloadType: 97, encodingName: "PCMA", clockRate: sampleRate, channels };
+    case CodecPCML:
+      // Raw PCM signed 16-bit little-endian → L16 in RTP (big-endian)
+      return { payloadType: 97, encodingName: "L16", clockRate: sampleRate, channels };
+    case CodecAACADTS: case CodecAACRaw: case CodecAACLATM: case CodecAACAlt:
+      return { payloadType: 97, encodingName: "MPEG4-GENERIC", clockRate: sampleRate, channels,
+        fmtp: `streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3` };
+    case CodecOpus:
+      return { payloadType: 97, encodingName: "opus", clockRate: 48000, channels: 2 };
+    default:
+      return null;
+  }
+}
+
+// ─── SDP builders ───────────────────────────────────────────────
+
+function buildVideoSdp(videoType: VideoType, videoPT: number, sps?: Buffer, pps?: Buffer, vps?: Buffer): string {
+  let sdp = `m=video 0 RTP/AVP ${videoPT}\r\nc=IN IP4 0.0.0.0\r\n`;
   sdp += `a=rtpmap:${videoPT} ${videoType}/90000\r\n`;
   if (videoType === "H264" && sps && pps) {
     const pli = sps.length >= 4 ? sps.subarray(1, 4).toString("hex") : "";
@@ -91,6 +128,25 @@ function buildSdp(videoType: VideoType, videoPT: number, sps?: Buffer, pps?: Buf
   }
   return sdp;
 }
+
+function buildAudioSdp(info: AudioRtpInfo): string {
+  let sdp = `m=audio 0 RTP/AVP ${info.payloadType}\r\nc=IN IP4 0.0.0.0\r\n`;
+  // Always include rtpmap (even for static PTs, for clarity)
+  sdp += `a=rtpmap:${info.payloadType} ${info.encodingName}/${info.clockRate}${info.channels > 1 ? `/${info.channels}` : ""}\r\n`;
+  if (info.fmtp) {
+    sdp += `a=fmtp:${info.payloadType} ${info.fmtp}\r\n`;
+  }
+  return sdp;
+}
+
+function buildFullSdp(videoSdp: string, audioSdp?: string): string {
+  let sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=Wyze\r\nt=0 0\r\n";
+  sdp += videoSdp;
+  if (audioSdp) sdp += audioSdp;
+  return sdp;
+}
+
+// ─── Video packetization ────────────────────────────────────────
 
 function packetizeH264Nal(nal: Buffer, w: RtpWriter, ts: number, marker: boolean, maxPayload: number): Buffer[] {
   if (nal.length <= maxPayload) return [buildRtpPacket(w, marker, ts, nal)];
@@ -131,6 +187,17 @@ function packetizeH265Nal(nal: Buffer, w: RtpWriter, ts: number, marker: boolean
   return pkts;
 }
 
+// ─── PCM byte-swap (L16 LE → L16 BE for RTP) ───────────────────
+
+function pcmLEToBE(buf: Buffer): Buffer {
+  const out = Buffer.allocUnsafe(buf.length);
+  for (let i = 0; i < buf.length - 1; i += 2) {
+    out[i] = buf[i + 1]!;
+    out[i + 1] = buf[i]!;
+  }
+  return out;
+}
+
 // ─── RFC 4571 framing ───────────────────────────────────────────
 
 function writeRfc4571(socket: net.Socket, rtpPacket: Buffer): void {
@@ -160,6 +227,10 @@ export interface WyzeRfc4571Server {
   /** The underlying P2P connection — use for camera commands, snapshots, etc. */
   connection: import("../tutk/dtls/WyzeDTLSConn.js").WyzeDTLSConn;
   close: () => Promise<void>;
+  /** Number of currently connected TCP clients. */
+  readonly clientCount: number;
+  /** Register a callback for when a client disconnects (receives remaining client count). */
+  onClientDisconnect: (cb: (remainingClients: number) => void) => void;
 }
 
 export async function createWyzeRfc4571Server(
@@ -180,7 +251,12 @@ export async function createWyzeRfc4571Server(
   const clients = new Set<net.Socket>();
   let sdp = "";
   let videoType: VideoType = "H264";
+  let videoSdpPart = "";
+  let audioSdpPart = "";
   let paramSetsExtracted = false;
+  let audioDetected = false;
+  let audioWriter: RtpWriter | null = null;
+  let audioCodecId = 0;
   let closed = false;
 
   // ─── P2P Connection ─────────────────────────────────────────
@@ -201,6 +277,12 @@ export async function createWyzeRfc4571Server(
   await conn.startVideo(frameSize, bitrate);
   await conn.startAudio();
 
+  const rebuildSdp = () => {
+    if (videoSdpPart) {
+      sdp = buildFullSdp(videoSdpPart, audioSdpPart || undefined);
+    }
+  };
+
   // ─── Frame handler → RTP muxer ─────────────────────────────
 
   conn.onPacket((pkt: Packet) => {
@@ -210,24 +292,25 @@ export async function createWyzeRfc4571Server(
       const isH265 = pkt.codec === CodecH265;
       videoType = isH265 ? "H265" : "H264";
 
-      // Extract param sets from first keyframe for SDP (ALWAYS, even without clients)
+      // Extract param sets from first keyframe for SDP
       if (pkt.isKeyframe && !paramSetsExtracted) {
         if (isH265) {
           const { vps, sps, pps } = extractH265Params(pkt.payload);
           if (vps && sps && pps) {
-            sdp = buildSdp("H265", videoPayloadType, sps, pps, vps);
+            videoSdpPart = buildVideoSdp("H265", videoPayloadType, sps, pps, vps);
             paramSetsExtracted = true;
+            rebuildSdp();
           }
         } else {
           const { sps, pps } = extractH264Params(pkt.payload);
           if (sps && pps) {
-            sdp = buildSdp("H264", videoPayloadType, sps, pps);
+            videoSdpPart = buildVideoSdp("H264", videoPayloadType, sps, pps);
             paramSetsExtracted = true;
+            rebuildSdp();
           }
         }
       }
 
-      // Only send RTP to clients if there are any
       if (clients.size === 0) return;
 
       // Packetize NALs
@@ -244,17 +327,44 @@ export async function createWyzeRfc4571Server(
           for (const c of clients) writeRfc4571(c, rtp);
         }
       }
+    } else if (isAudioCodec(pkt.codec)) {
+      // Detect audio codec from first audio packet
+      if (!audioDetected) {
+        audioDetected = true;
+        audioCodecId = pkt.codec;
+        const info = getAudioRtpInfo(pkt.codec, pkt.sampleRate || 8000, pkt.channels || 1);
+        if (info) {
+          audioWriter = createRtpWriter(info.payloadType);
+          audioSdpPart = buildAudioSdp(info);
+          rebuildSdp();
+          logger.log?.(`[wyze-rfc4571] Audio detected: ${info.encodingName}/${info.clockRate}`);
+        } else {
+          logger.log?.(`[wyze-rfc4571] Unsupported audio codec: 0x${pkt.codec.toString(16)}`);
+        }
+      }
+
+      if (!audioWriter || clients.size === 0) return;
+
+      // For PCML (raw PCM LE), byte-swap to big-endian for L16 RTP
+      const payload = audioCodecId === CodecPCML ? pcmLEToBE(pkt.payload) : pkt.payload;
+      const rtp = buildRtpPacket(audioWriter, true, pkt.timestamp, payload);
+      for (const c of clients) writeRfc4571(c, rtp);
     }
-    // Audio: skip for now (PCM raw isn't standard RTP; could add PCMU/AAC later)
   });
 
   // ─── TCP server ─────────────────────────────────────────────
+
+  const disconnectCallbacks: Array<(remaining: number) => void> = [];
 
   const server = net.createServer((socket) => {
     if (closed) { socket.destroy(); return; }
     logger.log?.(`[wyze-rfc4571] Client connected from ${socket.remoteAddress}`);
     clients.add(socket);
-    const cleanup = () => { clients.delete(socket); try { socket.destroy(); } catch {} };
+    const cleanup = () => {
+      clients.delete(socket);
+      try { socket.destroy(); } catch {}
+      for (const cb of disconnectCallbacks) cb(clients.size);
+    };
     socket.on("error", cleanup);
     socket.on("close", cleanup);
   });
@@ -267,14 +377,26 @@ export async function createWyzeRfc4571Server(
   const addr = server.address() as net.AddressInfo;
   logger.log?.(`[wyze-rfc4571] Listening on ${addr.address}:${addr.port}`);
 
-  // Wait for SDP (first keyframe)
+  // Wait for SDP (first keyframe + optional audio, with timeout)
   if (!paramSetsExtracted) {
     logger.log?.(`[wyze-rfc4571] Waiting for first keyframe...`);
     await new Promise<void>((resolve) => {
       const check = setInterval(() => {
-        if (paramSetsExtracted || closed) { clearInterval(check); resolve(); }
+        if (closed) { clearInterval(check); resolve(); return; }
+        // Resolve once we have video params; audio is best-effort
+        if (paramSetsExtracted) { clearInterval(check); resolve(); }
       }, 100);
       setTimeout(() => { clearInterval(check); resolve(); }, 10000);
+    });
+  }
+
+  // Give audio a short grace period to be detected if video is ready
+  if (paramSetsExtracted && !audioDetected) {
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (audioDetected || closed) { clearInterval(check); resolve(); }
+      }, 50);
+      setTimeout(() => { clearInterval(check); resolve(); }, 2000);
     });
   }
 
@@ -295,5 +417,7 @@ export async function createWyzeRfc4571Server(
     videoType,
     connection: conn,
     close: closeFn,
+    get clientCount() { return clients.size; },
+    onClientDisconnect: (cb: (remaining: number) => void) => { disconnectCallbacks.push(cb); },
   };
 }
