@@ -913,12 +913,12 @@ export class WyzeDTLSConn extends EventEmitter {
   }
 
   private sendPeriodicAck(): void {
-    this.ackFlags++;
+    this.ackFlags = (this.ackFlags + 1) & 0xFFFF;
     const ack = Buffer.alloc(24); ack.writeUInt16LE(0x0009, 0); ack.writeUInt16LE(0x000c, 2);
-    ack.writeUInt32LE(this.ackAvSeq, 4); this.ackAvSeq++;
+    ack.writeUInt32LE(this.ackAvSeq, 4); this.ackAvSeq = (this.ackAvSeq + 1) >>> 0;
     ack.writeUInt16LE(this.rxSeqStart, 8); ack.writeUInt16LE(this.rxSeqEnd, 10);
     if (this.rxSeqInit) this.rxSeqStart = this.rxSeqEnd;
-    ack.writeUInt16LE(this.ackFlags, 12); ack.writeUInt32LE(this.ackFlags << 16, 16); ack.writeUInt16LE(Date.now() & 0xffff, 20);
+    ack.writeUInt16LE(this.ackFlags, 12); ack.writeUInt32LE((this.ackFlags << 16) >>> 0, 16); ack.writeUInt16LE(Date.now() & 0xffff, 20);
     this.udpSend(this.msgTxData(this.dtlsWrite(23, ack), 0)).catch(() => {});
   }
 
