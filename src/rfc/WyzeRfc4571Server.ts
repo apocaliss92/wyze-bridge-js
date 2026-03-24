@@ -60,13 +60,27 @@ function splitAnnexBToNals(data: Buffer): Buffer[] {
     if (start < j) nals.push(data.subarray(start, j));
     i = j;
   }
+
+  // If no Annex-B start codes were found, the payload may be a raw NAL unit
+  // (some TUTK firmware versions omit start codes). Treat the entire buffer
+  // as a single NAL if it looks like valid NAL data (forbidden_zero_bit == 0).
+  if (nals.length === 0 && data.length > 0 && (data[0]! & 0x80) === 0) {
+    nals.push(data);
+  }
+
   return nals;
 }
 
 function extractH264Params(au: Buffer): { sps?: Buffer; pps?: Buffer } {
   const nals = splitAnnexBToNals(au);
   let sps: Buffer | undefined, pps: Buffer | undefined;
-  for (const n of nals) { const t = n[0]! & 0x1f; if (t === 7) sps = n; if (t === 8) pps = n; }
+  for (const n of nals) {
+    if (n.length < 1) continue;
+    const t = n[0]! & 0x1f;
+    // SPS must be at least 4 bytes (NAL header + profile_idc + constraints + level_idc)
+    if (t === 7 && n.length >= 4) sps = n;
+    if (t === 8) pps = n;
+  }
   return { sps, pps };
 }
 

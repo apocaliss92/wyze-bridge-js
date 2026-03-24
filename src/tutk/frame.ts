@@ -243,11 +243,19 @@ export class FrameHandler {
 
     if (cs.waitSeq !== cs.pktTotal || !cs.frameInfo) return;
 
-    const fullPayload = Buffer.concat(cs.waitData);
+    const raw = Buffer.concat(cs.waitData);
     const info = cs.frameInfo;
     this.resetChannel(cs);
 
-    if (fullPayload.length === 0) return;
+    if (raw.length === 0) return;
+
+    // Trim to the declared payload size from the FrameInfo trailer.
+    // The concatenated packet payloads may contain trailing padding bytes
+    // beyond the actual video data, which corrupt NAL unit parsing
+    // (e.g., garbage SPS values, RangeError in h264-sps-parser).
+    const fullPayload = info.payloadSize > 0 && info.payloadSize < raw.length
+      ? raw.subarray(0, info.payloadSize)
+      : raw;
 
     const accumUS = this.updateTS(this.videoTS, info.timestamp);
     const rtpTS = Number((accumUS * 90000n) / 1000000n);
