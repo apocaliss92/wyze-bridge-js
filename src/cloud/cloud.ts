@@ -11,6 +11,27 @@ import type { WyzeCamera, WyzeAuthError } from "./types.js";
 
 const BASE_URL_AUTH = "https://auth-prod.api.wyze.com";
 const BASE_URL_API = "https://api.wyzecam.com";
+
+/** Safely parse JSON from a fetch Response with diagnostic error messages. */
+async function safeJsonParse<T>(res: Response, context: string): Promise<T> {
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `Wyze ${context}: HTTP ${res.status} ${res.statusText}` +
+      (text ? ` — ${text.slice(0, 200)}` : " (empty body)"),
+    );
+  }
+  if (!text) {
+    throw new Error(`Wyze ${context}: empty response body (HTTP ${res.status})`);
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(
+      `Wyze ${context}: invalid JSON (HTTP ${res.status}) — ${text.slice(0, 200)}`,
+    );
+  }
+}
 const APP_NAME = "com.hualai.WyzeCam";
 const APP_VERSION = "2.50.0";
 
@@ -111,7 +132,7 @@ export class WyzeCloud {
       body: JSON.stringify(payload),
     });
 
-    const body = await res.json() as LoginResponse & ApiErrorResponse;
+    const body = await safeJsonParse<LoginResponse & ApiErrorResponse>(res, "login");
 
     // Check for API errors
     if (body.code && body.code !== "1" && body.code !== "0") {
@@ -165,7 +186,7 @@ export class WyzeCloud {
       body: JSON.stringify(payload),
     });
 
-    const body = await res.json() as DeviceListResponse;
+    const body = await safeJsonParse<DeviceListResponse>(res, "getCameraList");
 
     if (body.code !== "1") {
       throw new Error(`Wyze API error: ${body.code} - ${body.msg}`);
@@ -255,7 +276,7 @@ export class WyzeCloud {
       body: JSON.stringify(payload),
     });
 
-    const body = await res.json() as any;
+    const body = await safeJsonParse<any>(res, "getEventList");
     if (body.code !== "1") {
       throw new Error(`Wyze events API error: ${body.code} - ${body.msg}`);
     }
