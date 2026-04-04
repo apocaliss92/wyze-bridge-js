@@ -832,26 +832,52 @@ export class WyzeDTLSConn extends EventEmitter {
   // ─── Frame listener (after auth) ─────────────────────────────
 
   private startFrameListener(): void {
+    let udpPackets = 0;
+    let dtlsRecords = 0;
+    let decryptErrors = 0;
+    let frameData = 0;
+    let keepalives = 0;
+    const startedAt = Date.now();
+
+    // Periodic stats log (every 30s)
+    const statsTimer = setInterval(() => {
+      if (this.closed) { clearInterval(statsTimer); return; }
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(0);
+      this.log(
+        `[Wyze-P2P] stats: ${elapsed}s elapsed  udp=${udpPackets} dtls=${dtlsRecords} ` +
+        `frames=${frameData} keepalives=${keepalives} decryptErr=${decryptErrors}`,
+      );
+    }, 30_000);
+
     this.messageListener = (msg: Buffer, ri: dgram.RemoteInfo) => {
       if (ri.address !== this.host || this.closed) return;
       this.remotePort = ri.port;
+      udpPackets++;
       const decoded = reverseTransCodeBlob(msg);
       if (decoded.length < 16) return;
       const cmd = decoded.readUInt16LE(8);
 
-      if (cmd === 0x0428 && decoded.length > 24) { this.udpSend(this.msgKeepaliveAck(decoded)).catch(() => {}); return; }
+      if (cmd === 0x0428 && decoded.length > 24) {
+        keepalives++;
+        this.udpSend(this.msgKeepaliveAck(decoded)).catch(() => {});
+        return;
+      }
 
       if (cmd === 0x0408 && decoded.length > 28 && decoded[14] === 0) {
         for (const r of parseAllRecords(decoded.subarray(28))) {
           if (r.contentType === 23 && r.epoch === 1) {
+            dtlsRecords++;
             try {
               const plain = chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 23, r.fragment);
               this.trackSeq(plain);
               const ch = plain[0]!;
               if (ch === ChannelIVideo || ch === ChannelPVideo || ch === ChannelAudio) {
+                frameData++;
                 this.frameHandler.handle(plain);
               }
-            } catch {}
+            } catch {
+              decryptErrors++;
+            }
           }
         }
       }

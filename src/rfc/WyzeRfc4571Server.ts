@@ -273,6 +273,11 @@ export async function createWyzeRfc4571Server(
   let audioCodecId = 0;
   let closed = false;
 
+  // ─── Stream health monitoring ──────────────────────────────
+  let totalPackets = 0;
+  let lastPacketAt = 0;
+  let healthTimer: ReturnType<typeof setInterval> | undefined;
+
   // ─── P2P Connection ─────────────────────────────────────────
 
   const conn = new WyzeDTLSConn({
@@ -302,6 +307,8 @@ export async function createWyzeRfc4571Server(
 
   conn.onPacket((pkt: Packet) => {
     if (closed) return;
+    totalPackets++;
+    lastPacketAt = Date.now();
 
     if (isVideoCodec(pkt.codec)) {
       const isH265 = pkt.codec === CodecH265;
@@ -415,14 +422,32 @@ export async function createWyzeRfc4571Server(
     });
   }
 
+  // ─── P2P health monitor: detect dead connection ─────────────
+  // If no packets arrive for 10s, the P2P connection is likely dead.
+  // Log diagnostics and close so the plugin can reconnect.
+  lastPacketAt = Date.now();
+  healthTimer = setInterval(() => {
+    if (closed) { clearInterval(healthTimer); return; }
+    const silenceMs = Date.now() - lastPacketAt;
+    if (silenceMs > 10_000) {
+      logger.log?.(
+        `[wyze-rfc4571] P2P stream dead: no packets for ${(silenceMs / 1000).toFixed(1)}s ` +
+        `(totalPackets=${totalPackets} clients=${clients.size}) — closing connection`,
+      );
+      clearInterval(healthTimer);
+      closeFn().catch(() => {});
+    }
+  }, 3_000);
+
   const closeFn = async () => {
     if (closed) return;
     closed = true;
+    if (healthTimer) clearInterval(healthTimer);
     for (const c of clients) { try { c.destroy(); } catch {} }
     clients.clear();
     server.close();
     conn.close();
-    logger.log?.(`[wyze-rfc4571] Closed`);
+    logger.log?.(`[wyze-rfc4571] Closed (totalPackets=${totalPackets})`);
   };
 
   return {

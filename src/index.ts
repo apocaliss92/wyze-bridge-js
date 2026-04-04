@@ -6,7 +6,7 @@
 // Cloud API
 export { WyzeCloud } from "./cloud/cloud.js";
 export type { WyzeCamera, WyzeAccountConfig, WyzeAuthError } from "./cloud/types.js";
-export type { WyzeEvent, WyzeEventFile } from "./cloud/cloud.js";
+export type { WyzeEvent, WyzeEventFile, WyzeCloudSession, WyzeCloudOptions } from "./cloud/cloud.js";
 export { buildStreamUrl } from "./cloud/types.js";
 
 // P2P Connection

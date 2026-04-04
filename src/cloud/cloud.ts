@@ -96,6 +96,27 @@ interface ApiErrorResponse {
   description?: string;
 }
 
+// ─── Session persistence ────────────────────────────────────────
+
+export interface WyzeCloudSession {
+  accessToken: string;
+  refreshToken: string;
+  phoneId: string;
+  /** ISO timestamp when the session was saved. */
+  savedAt: string;
+}
+
+export interface WyzeCloudOptions {
+  apiKey: string;
+  apiId: string;
+  /** Load a previously saved session. Return null if none available. */
+  loadSession?: () => WyzeCloudSession | null;
+  /** Save session for reuse across restarts. */
+  saveSession?: (session: WyzeCloudSession) => void;
+  /** Clear a previously saved session (e.g. after auth failure). */
+  clearSession?: () => void;
+}
+
 // ─── Cloud client ───────────────────────────────────────────────
 
 export class WyzeCloud {
@@ -103,12 +124,41 @@ export class WyzeCloud {
   private keyId: string;
   private phoneId: string;
   private accessToken: string | null = null;
+  private refreshToken: string | null = null;
   private cameras: WyzeCamera[] = [];
+  private loadSession?: () => WyzeCloudSession | null;
+  private saveSession?: (session: WyzeCloudSession) => void;
+  private clearSession?: () => void;
 
-  constructor(apiKey: string, apiId: string) {
-    this.apiKey = apiKey;
-    this.keyId = apiId;
-    this.phoneId = generatePhoneId();
+  constructor(apiKeyOrOpts: string | WyzeCloudOptions, apiId?: string) {
+    if (typeof apiKeyOrOpts === "string") {
+      // Legacy constructor: WyzeCloud(apiKey, apiId)
+      this.apiKey = apiKeyOrOpts;
+      this.keyId = apiId!;
+      this.phoneId = generatePhoneId();
+    } else {
+      // New constructor: WyzeCloud(options)
+      this.apiKey = apiKeyOrOpts.apiKey;
+      this.keyId = apiKeyOrOpts.apiId;
+      this.loadSession = apiKeyOrOpts.loadSession;
+      this.saveSession = apiKeyOrOpts.saveSession;
+      this.clearSession = apiKeyOrOpts.clearSession;
+
+      // Try to restore a previous session
+      const saved = this.loadSession?.();
+      if (saved?.accessToken && saved?.refreshToken) {
+        this.accessToken = saved.accessToken;
+        this.refreshToken = saved.refreshToken;
+        this.phoneId = saved.phoneId || generatePhoneId();
+      } else {
+        this.phoneId = generatePhoneId();
+      }
+    }
+  }
+
+  /** Whether a session (access token) is currently available. */
+  get hasSession(): boolean {
+    return this.accessToken != null;
   }
 
   /**
@@ -157,6 +207,81 @@ export class WyzeCloud {
     }
 
     this.accessToken = body.access_token;
+    this.refreshToken = body.refresh_token ?? null;
+    this.persistSession();
+  }
+
+  /**
+   * Refresh the access token using the refresh token.
+   * Falls back to full login if refresh fails.
+   */
+  async refreshAccessToken(email: string, password: string): Promise<void> {
+    if (!this.refreshToken) {
+      return this.login(email, password);
+    }
+
+    try {
+      const res = await fetch(`${BASE_URL_API}/app/user/refresh_token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          app_name: APP_NAME,
+          app_ver: `${APP_NAME}___${APP_VERSION}`,
+          app_version: APP_VERSION,
+          phone_id: this.phoneId,
+          phone_system_type: 1,
+          refresh_token: this.refreshToken,
+          sc: "9f275790cab94a72bd206c8876429f3c",
+          sv: "9d74946e652647e9b6c9d59326aef104",
+          ts: Date.now(),
+        }),
+      });
+
+      const body = await safeJsonParse<any>(res, "refreshToken");
+
+      if (body.code === "1" && body.data?.access_token) {
+        this.accessToken = body.data.access_token;
+        this.refreshToken = body.data.refresh_token ?? this.refreshToken;
+        this.persistSession();
+        return;
+      }
+    } catch {
+      // refresh failed — fall through to full login
+    }
+
+    // Clear stale session and do full login
+    this.accessToken = null;
+    this.refreshToken = null;
+    this.clearSession?.();
+    return this.login(email, password);
+  }
+
+  /**
+   * Ensure we have a valid session. Uses existing token, refresh, or
+   * full login as needed. Prefer this over calling login() directly.
+   */
+  async ensureSession(email: string, password: string): Promise<void> {
+    // If we have an access token, try to use it (it may be expired,
+    // but getCameraList will catch that via the API error code).
+    if (this.accessToken) return;
+
+    // Try refresh first, fall back to login
+    if (this.refreshToken) {
+      return this.refreshAccessToken(email, password);
+    }
+
+    return this.login(email, password);
+  }
+
+  private persistSession(): void {
+    if (this.saveSession && this.accessToken && this.refreshToken) {
+      this.saveSession({
+        accessToken: this.accessToken,
+        refreshToken: this.refreshToken,
+        phoneId: this.phoneId,
+        savedAt: new Date().toISOString(),
+      });
+    }
   }
 
   /**
@@ -189,6 +314,11 @@ export class WyzeCloud {
     const body = await safeJsonParse<DeviceListResponse>(res, "getCameraList");
 
     if (body.code !== "1") {
+      // Token might be expired — clear it so ensureSession() will refresh
+      if (body.code === "2001" || body.msg?.toLowerCase().includes("token")) {
+        this.accessToken = null;
+        this.clearSession?.();
+      }
       throw new Error(`Wyze API error: ${body.code} - ${body.msg}`);
     }
 
