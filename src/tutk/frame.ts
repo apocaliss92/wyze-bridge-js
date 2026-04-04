@@ -249,10 +249,23 @@ export class FrameHandler {
 
     if (raw.length === 0) return;
 
-    // Trim to the declared payload size from the FrameInfo trailer.
-    // The concatenated packet payloads may contain trailing padding bytes
-    // beyond the actual video data, which corrupt NAL unit parsing
-    // (e.g., garbage SPS values, RangeError in h264-sps-parser).
+    // Validate payload size against the declared size in FrameInfo trailer.
+    // Mismatches indicate corruption or reassembly errors — drop the frame
+    // entirely (aligned with go2rtc Go implementation which logs [SIZE]).
+    // Without this check, trailing bytes corrupt NAL unit parsing
+    // (e.g., garbage SPS VUI/HRD values, RangeError in h264-sps-parser).
+    if (info.payloadSize > 0 && info.payloadSize !== raw.length) {
+      if (this.verbose) {
+        console.warn(
+          `[FrameHandler] [SIZE] frame=${info.frameNo} declared=${info.payloadSize} actual=${raw.length}, dropping`,
+        );
+      }
+      // If declared size is smaller, trim instead of dropping — the camera
+      // may pad frames. But if declared size exceeds raw length, the frame
+      // is definitely truncated/corrupt — drop it.
+      if (info.payloadSize > raw.length) return;
+    }
+
     const fullPayload = info.payloadSize > 0 && info.payloadSize < raw.length
       ? raw.subarray(0, info.payloadSize)
       : raw;
