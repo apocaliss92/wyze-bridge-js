@@ -71,6 +71,193 @@ function splitAnnexBToNals(data: Buffer): Buffer[] {
   return nals;
 }
 
+/**
+ * Strip VUI parameters from an H.264 SPS NAL to produce a clean SPS
+ * suitable for SDP sprop-parameter-sets.
+ *
+ * The Wyze camera's SPS has trailing bytes beyond the core parameters that
+ * corrupt the VUI/HRD section (garbage colour_primaries, cpb_cnt, etc.).
+ * The Scrypted prebuffer plugin parses the SPS from the SDP and rejects
+ * streams with invalid VUI values, killing the session immediately.
+ *
+ * Fix: rebuild the SPS with vui_parameters_present_flag=0 and proper RBSP
+ * trailing bits. VUI is optional and not needed for decoding.
+ */
+function stripSpsVui(sps: Buffer): Buffer {
+  // H.264 SPS bit-level parsing (minimal, just enough to find vui_parameters_present_flag)
+  // NAL header (1 byte) + profile_idc(8) + constraint_set_flags(8) + level_idc(8) = 4 bytes fixed
+  if (sps.length < 4) return sps;
+
+  // Instead of complex bit parsing, rebuild a minimal SPS from the known fields.
+  // We know the Wyze camera sends: profile 77 (Main), level 41, 1920x1080.
+  // Build a clean SPS with the same parameters but no VUI.
+  const profile = sps[1]!;
+  const constraints = sps[2]!;
+  const level = sps[3]!;
+
+  // Minimal SPS NAL: nal_header + profile + constraints + level + sps_id(0) +
+  // log2_max_frame_num(4) + pic_order_cnt_type(0) + log2_max_pic_order_cnt_lsb(10) +
+  // max_num_ref_frames(1) + gaps(0) + width(120) + height(68) + frame_mbs_only(1) +
+  // direct_8x8(1) + frame_cropping(1,0,0,0,4) + vui_present(0) + rbsp_stop_bit
+  //
+  // Rather than bit-packing manually, use the original SPS bytes up to just before
+  // the vui_parameters_present_flag, then clear that flag.
+  //
+  // Simpler approach: use the raw SPS but cap it at a safe length.
+  // The core SPS for this camera (Main profile, no scaling matrices) is ~15-20 bytes.
+  // VUI starts after frame_cropping. We'll parse byte-by-byte to find the boundary.
+
+  // Actually, the simplest robust fix: parse only the Exp-Golomb fields we need,
+  // then output a fresh, minimal bitstream.
+  try {
+    return buildCleanSps(sps);
+  } catch {
+    // If clean rebuild fails, return original (better than nothing)
+    return sps;
+  }
+}
+
+/** Minimal bitstream reader for Exp-Golomb coded H.264 SPS fields. */
+class BitReader {
+  private buf: Buffer;
+  private pos = 0; // bit position
+  constructor(buf: Buffer) { this.buf = buf; }
+  get bitsLeft() { return this.buf.length * 8 - this.pos; }
+  readBit(): number {
+    if (this.pos >= this.buf.length * 8) throw new Error("EOF");
+    const byte = this.buf[this.pos >> 3]!;
+    const bit = (byte >> (7 - (this.pos & 7))) & 1;
+    this.pos++;
+    return bit;
+  }
+  readBits(n: number): number {
+    let v = 0;
+    for (let i = 0; i < n; i++) v = (v << 1) | this.readBit();
+    return v;
+  }
+  readUE(): number { // unsigned Exp-Golomb
+    let zeros = 0;
+    while (this.readBit() === 0) zeros++;
+    if (zeros === 0) return 0;
+    return (1 << zeros) - 1 + this.readBits(zeros);
+  }
+  readSE(): number { // signed Exp-Golomb
+    const v = this.readUE();
+    return (v & 1) ? ((v + 1) >> 1) : -(v >> 1);
+  }
+}
+
+class BitWriter {
+  private bytes: number[] = [];
+  private cur = 0;
+  private bits = 0;
+  writeBit(b: number): void {
+    this.cur = (this.cur << 1) | (b & 1);
+    this.bits++;
+    if (this.bits === 8) { this.bytes.push(this.cur); this.cur = 0; this.bits = 0; }
+  }
+  writeBits(v: number, n: number): void {
+    for (let i = n - 1; i >= 0; i--) this.writeBit((v >> i) & 1);
+  }
+  writeUE(v: number): void {
+    const val = v + 1;
+    const len = 32 - Math.clz32(val);
+    for (let i = 0; i < len - 1; i++) this.writeBit(0);
+    this.writeBits(val, len);
+  }
+  writeSE(v: number): void {
+    this.writeUE(v <= 0 ? (-v * 2) : (v * 2 - 1));
+  }
+  /** Write RBSP trailing bits (1 + alignment zeros) */
+  writeTrailing(): void {
+    this.writeBit(1);
+    while (this.bits !== 0) this.writeBit(0);
+  }
+  toBuffer(): Buffer {
+    const out = [...this.bytes];
+    if (this.bits > 0) out.push(this.cur << (8 - this.bits));
+    return Buffer.from(out);
+  }
+}
+
+function buildCleanSps(origSps: Buffer): Buffer {
+  const r = new BitReader(origSps);
+  const w = new BitWriter();
+
+  // forbidden_zero_bit + nal_ref_idc + nal_unit_type
+  const nalHeader = r.readBits(8);
+  w.writeBits(nalHeader, 8);
+
+  // profile_idc, constraint_set0..5_flags + reserved, level_idc
+  const profile = r.readBits(8); w.writeBits(profile, 8);
+  const constraints = r.readBits(8); w.writeBits(constraints, 8);
+  const level = r.readBits(8); w.writeBits(level, 8);
+
+  // seq_parameter_set_id
+  const spsId = r.readUE(); w.writeUE(spsId);
+
+  // High profiles have extra fields
+  if (profile === 100 || profile === 110 || profile === 122 || profile === 244 ||
+      profile === 44 || profile === 83 || profile === 86 || profile === 118 || profile === 128) {
+    const chromaFormat = r.readUE(); w.writeUE(chromaFormat);
+    if (chromaFormat === 3) { const sep = r.readBit(); w.writeBit(sep); }
+    const bitDepthLuma = r.readUE(); w.writeUE(bitDepthLuma);
+    const bitDepthChroma = r.readUE(); w.writeUE(bitDepthChroma);
+    const qpPrime = r.readBit(); w.writeBit(qpPrime);
+    const seqScaling = r.readBit(); w.writeBit(seqScaling);
+    if (seqScaling) {
+      const cnt = chromaFormat !== 3 ? 8 : 12;
+      for (let i = 0; i < cnt; i++) {
+        const present = r.readBit(); w.writeBit(present);
+        if (present) {
+          // Skip scaling list (complex) — just return original SPS
+          return origSps;
+        }
+      }
+    }
+  }
+
+  // log2_max_frame_num_minus4
+  const log2MaxFn = r.readUE(); w.writeUE(log2MaxFn);
+  // pic_order_cnt_type
+  const pocType = r.readUE(); w.writeUE(pocType);
+  if (pocType === 0) {
+    const log2MaxPoc = r.readUE(); w.writeUE(log2MaxPoc);
+  } else if (pocType === 1) {
+    const delta = r.readBit(); w.writeBit(delta);
+    const offNonRef = r.readSE(); w.writeSE(offNonRef);
+    const offTop = r.readSE(); w.writeSE(offTop);
+    const numRefCycles = r.readUE(); w.writeUE(numRefCycles);
+    for (let i = 0; i < numRefCycles; i++) { const o = r.readSE(); w.writeSE(o); }
+  }
+  // max_num_ref_frames
+  const maxRef = r.readUE(); w.writeUE(maxRef);
+  // gaps_in_frame_num_value_allowed_flag
+  const gaps = r.readBit(); w.writeBit(gaps);
+  // pic_width_in_mbs_minus1, pic_height_in_map_units_minus1
+  const width = r.readUE(); w.writeUE(width);
+  const height = r.readUE(); w.writeUE(height);
+  // frame_mbs_only_flag
+  const frameMbs = r.readBit(); w.writeBit(frameMbs);
+  if (!frameMbs) { const mbAdaptive = r.readBit(); w.writeBit(mbAdaptive); }
+  // direct_8x8_inference_flag
+  const direct8x8 = r.readBit(); w.writeBit(direct8x8);
+  // frame_cropping_flag
+  const cropping = r.readBit(); w.writeBit(cropping);
+  if (cropping) {
+    for (let i = 0; i < 4; i++) { const c = r.readUE(); w.writeUE(c); }
+  }
+
+  // HERE: instead of copying vui_parameters_present_flag and VUI data,
+  // write vui_parameters_present_flag = 0
+  w.writeBit(0); // vui_parameters_present_flag = 0
+
+  // RBSP trailing bits
+  w.writeTrailing();
+
+  return w.toBuffer();
+}
+
 function extractH264Params(au: Buffer): { sps?: Buffer; pps?: Buffer } {
   const nals = splitAnnexBToNals(au);
   let sps: Buffer | undefined, pps: Buffer | undefined;
@@ -78,7 +265,7 @@ function extractH264Params(au: Buffer): { sps?: Buffer; pps?: Buffer } {
     if (n.length < 1) continue;
     const t = n[0]! & 0x1f;
     // SPS must be at least 4 bytes (NAL header + profile_idc + constraints + level_idc)
-    if (t === 7 && n.length >= 4) sps = n;
+    if (t === 7 && n.length >= 4) sps = stripSpsVui(n);
     if (t === 8) pps = n;
   }
   return { sps, pps };
