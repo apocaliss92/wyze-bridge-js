@@ -432,6 +432,12 @@ export interface WyzeRfc4571Server {
   readonly clientCount: number;
   /** Register a callback for when a client disconnects (receives remaining client count). */
   onClientDisconnect: (cb: (remainingClients: number) => void) => void;
+  /**
+   * Register a callback for when the server is closed internally (e.g. by the
+   * P2P health monitor detecting a dead stream). Plugins should use this to
+   * release their server reference so the next stream request creates a new one.
+   */
+  onServerClose: (cb: (reason: string) => void) => void;
 }
 
 export async function createWyzeRfc4571Server(
@@ -564,6 +570,7 @@ export async function createWyzeRfc4571Server(
   // ─── TCP server ─────────────────────────────────────────────
 
   const disconnectCallbacks: Array<(remaining: number) => void> = [];
+  const serverCloseCallbacks: Array<(reason: string) => void> = [];
 
   const server = net.createServer((socket) => {
     if (closed) { socket.destroy(); return; }
@@ -617,16 +624,14 @@ export async function createWyzeRfc4571Server(
     if (closed) { clearInterval(healthTimer); return; }
     const silenceMs = Date.now() - lastPacketAt;
     if (silenceMs > 10_000) {
-      logger.log?.(
-        `[wyze-rfc4571] P2P stream dead: no packets for ${(silenceMs / 1000).toFixed(1)}s ` +
-        `(totalPackets=${totalPackets} clients=${clients.size}) — closing connection`,
-      );
+      const reason = `P2P stream dead: no packets for ${(silenceMs / 1000).toFixed(1)}s (totalPackets=${totalPackets} clients=${clients.size})`;
+      logger.log?.(`[wyze-rfc4571] ${reason} — closing connection`);
       clearInterval(healthTimer);
-      closeFn().catch(() => {});
+      closeFnWithReason(reason).catch(() => {});
     }
   }, 3_000);
 
-  const closeFn = async () => {
+  const closeFnWithReason = async (reason: string) => {
     if (closed) return;
     closed = true;
     if (healthTimer) clearInterval(healthTimer);
@@ -634,8 +639,14 @@ export async function createWyzeRfc4571Server(
     clients.clear();
     server.close();
     conn.close();
-    logger.log?.(`[wyze-rfc4571] Closed (totalPackets=${totalPackets})`);
+    logger.log?.(`[wyze-rfc4571] Closed reason="${reason}" totalPackets=${totalPackets}`);
+    // Notify plugins so they can release stale server refs and reconnect.
+    for (const cb of serverCloseCallbacks) {
+      try { cb(reason); } catch {}
+    }
   };
+
+  const closeFn = async () => closeFnWithReason("external close");
 
   return {
     host: addr.address,
@@ -646,5 +657,6 @@ export async function createWyzeRfc4571Server(
     close: closeFn,
     get clientCount() { return clients.size; },
     onClientDisconnect: (cb: (remaining: number) => void) => { disconnectCallbacks.push(cb); },
+    onServerClose: (cb: (reason: string) => void) => { serverCloseCallbacks.push(cb); },
   };
 }
