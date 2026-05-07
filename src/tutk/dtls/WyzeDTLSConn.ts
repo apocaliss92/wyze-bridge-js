@@ -99,7 +99,7 @@ function chacha20Decrypt(key: Buffer, iv: Buffer, epoch: number, seq: number, ct
 export class WyzeDTLSConn extends EventEmitter {
   private socket: dgram.Socket | null = null;
   private remotePort: number;
-  private readonly host: string;
+  private host: string; // mutable — broadcast discovery may update to actual IP
   private readonly uid: string;
   private readonly enr: string;
   private readonly mac: string;
@@ -160,11 +160,14 @@ export class WyzeDTLSConn extends EventEmitter {
   async connect(): Promise<{ hasTwoWay: boolean; authInfo: any }> {
     this.socket = dgram.createSocket("udp4");
     await new Promise<void>(r => this.socket!.bind(0, r));
+    this.socket.setBroadcast(true);
     if (this.verbose) this.log(`[Wyze] UDP bound :${this.socket.address().port}`);
 
-    // 1. IOTC Discovery
-    await this.writeAndWait(this.msgDisco(1), r => r.length >= 16 && r.readUInt16LE(8) === 0x0602);
-    if (this.verbose) this.log("[Wyze] Discovery OK");
+    // 1. IOTC Discovery — send both unicast (stored IP) and subnet broadcast so we
+    //    find the camera even if the Wyze cloud API returned a stale IP.
+    const broadcastAddr = this.host.split(".").slice(0, 3).join(".") + ".255";
+    await this.writeAndWaitWithFallback(this.msgDisco(1), r => r.length >= 16 && r.readUInt16LE(8) === 0x0602, broadcastAddr);
+    if (this.verbose) this.log(`[Wyze] Discovery OK (connected to ${this.host})`);
 
     // 2. Direct connect
     await this.udpSend(this.msgDisco(2));
@@ -948,6 +951,52 @@ export class WyzeDTLSConn extends EventEmitter {
         const d = reverseTransCodeBlob(msg); if (matchFn(d)) { cl(); res(d); } };
       const cl = () => { clearInterval(iv); this.socket!.removeListener("message", onMsg); };
       this.socket!.on("message", onMsg); this.udpSend(data).catch(() => {});
+    });
+  }
+
+  /**
+   * Like writeAndWait, but also sends to broadcastAddr every probe interval.
+   * Accepts responses from any host in the same /24 subnet — this handles the case
+   * where the Wyze cloud API returns a stale IP and the camera has a new DHCP address.
+   * On a successful match from a different IP, updates this.host to the real camera IP.
+   */
+  private writeAndWaitWithFallback(data: Buffer, matchFn: (d: Buffer) => boolean, broadcastAddr: string, ms = 5000): Promise<Buffer> {
+    return new Promise((res, rej) => {
+      const subnet = this.host.split(".").slice(0, 3).join(".") + ".";
+      const dl = Date.now() + ms;
+      this.log(`[Wyze] Discovery: unicast=${this.host}:${this.remotePort} broadcast=${broadcastAddr}:${this.remotePort}`);
+      const sendProbe = () => {
+        this.udpSend(data).catch(() => {});
+        this.socket!.send(transCodeBlob(data), this.remotePort, broadcastAddr, (e) => {
+          if (e) this.log(`[Wyze] broadcast send error: ${e.message}`);
+        });
+        // Also sweep every host in the /24 to handle cameras that ignore broadcast
+        const prefix = subnet.slice(0, -1); // "10.0.1"
+        for (let i = 1; i <= 254; i++) {
+          const ip = `${prefix}.${i}`;
+          if (ip === this.host) continue; // already sent unicast above
+          this.socket!.send(transCodeBlob(data), this.remotePort, ip, () => {});
+        }
+      };
+      const iv = setInterval(() => {
+        if (Date.now() > dl) { cl(); rej(new Error("Timeout")); return; }
+        sendProbe();
+      }, 1000);
+      const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
+        if (!ri.address.startsWith(subnet)) return;
+        const d = reverseTransCodeBlob(msg);
+        if (this.verbose) this.log(`[Wyze] Discovery UDP from ${ri.address}:${ri.port} cmd=0x${d.length >= 10 ? d.readUInt16LE(8).toString(16) : "?"}`);
+        if (!matchFn(d)) return;
+        if (ri.address !== this.host) {
+          this.log(`[Wyze] Camera found at ${ri.address} (stored IP was ${this.host}) — updating`);
+          this.host = ri.address;
+        }
+        this.remotePort = ri.port;
+        cl(); res(d);
+      };
+      const cl = () => { clearInterval(iv); this.socket!.removeListener("message", onMsg); };
+      this.socket!.on("message", onMsg);
+      sendProbe();
     });
   }
 

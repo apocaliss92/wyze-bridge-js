@@ -485,6 +485,11 @@ export async function createWyzeRfc4571Server(
 
   logger.log?.(`[wyze-rfc4571] Connecting to ${camera.nickname} (${camera.ip})...`);
   await conn.connect();
+  // conn.host may have been updated by broadcast discovery if the stored IP was stale
+  if ((conn as any).host !== camera.ip) {
+    logger.log?.(`[wyze-rfc4571] Actual IP: ${(conn as any).host}`);
+    camera.ip = (conn as any).host;
+  }
   logger.log?.(`[wyze-rfc4571] Connected, starting video...`);
 
   await conn.startVideo(frameSize, bitrate);
