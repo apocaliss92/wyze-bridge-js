@@ -9,8 +9,9 @@ import { EventEmitter } from "node:events";
 import { transCodeBlob, reverseTransCodeBlob, xxteaDecryptVar } from "../crypto.js";
 import { genSessionId, parseHL, findHL } from "../helpers.js";
 import { calculateAuthKey, derivePSK } from "./auth.js";
-import { FrameHandler, type Packet, ChannelAudio, ChannelIVideo, ChannelPVideo } from "../frame.js";
-import { isVideoCodec, isAudioCodec } from "../codec.js";
+import { FrameHandler, type Packet, ChannelAudio, ChannelIVideo, ChannelPVideo, FrameTypeStartAlt, FrameTypeEndSingle } from "../frame.js";
+import { isVideoCodec, isAudioCodec, getSampleRateIndex, getSamplesPerFrame } from "../codec.js";
+import { WyzeDtlsServer } from "./dtlsServer.js";
 
 // ─── CC51 transport variant ─────────────────────────────────────
 // Some Wyze firmwares answer discovery with the "CC51" protocol instead of
@@ -143,6 +144,15 @@ export class WyzeDTLSConn extends EventEmitter {
   private ticket = 0;
   private kaSeq = 0;
 
+  // Two-way audio (backchannel) state
+  private serverConn: WyzeDtlsServer | null = null;
+  private audioSeq = 0;
+  private audioFrameNo = 0;
+  private audioCodecId = 0;
+  private audioSampleRate = 0;
+  private audioChannels = 0;
+  private hasTwoWay = false;
+
   // Periodic ACK
   private ackFlags = 0;
   private ackAvSeq = 0;
@@ -201,6 +211,7 @@ export class WyzeDTLSConn extends EventEmitter {
     // 5. AV Login
     this.log("[Wyze] 5/6 av login…");
     const hasTwoWay = await this.doAVLogin();
+    this.hasTwoWay = hasTwoWay;
     this.log(`[Wyze] 5/6 av login OK (twoWay=${hasTwoWay})`);
 
     // Start periodic ACK
@@ -330,9 +341,125 @@ export class WyzeDTLSConn extends EventEmitter {
     await this.udpSend(this.msgTxData(this.dtlsWrite(23, this.msgIOCtrl(k10010)), 0));
   }
 
+  // ─── Two-way audio (backchannel) — ported from go2rtc ─────────────
+
+  /**
+   * Enable the return-audio channel and bring up the backchannel DTLS server.
+   * EXPERIMENTAL: the DTLS server handshake is hand-rolled (see dtlsServer.ts)
+   * and needs validation on real hardware.
+   */
+  async startIntercom(): Promise<void> {
+    if (this.serverConn) return;
+    // Enable return-audio media channel (K10010, mediaType 3).
+    const k10010 = this.buildK10010(3, true);
+    await this.udpSend(this.msgTxData(this.dtlsWrite(23, this.msgIOCtrl(k10010)), 0));
+
+    const server = new WyzeDtlsServer({
+      psk: this.psk,
+      send: (record) => { this.udpSend(this.msgTxData(record, 1)).catch(() => {}); },
+      log: this.log,
+      verbose: this.verbose,
+    });
+    this.serverConn = server;
+
+    this.log("[Wyze] intercom: DTLS server handshake…");
+    await server.handshake(5000);
+
+    // Camera sends its AV login over the backchannel; echo the checksum back.
+    const login = await server.recv(5000);
+    if (login.length >= 24) {
+      const checksum = login.readUInt32LE(20);
+      server.write(this.msgAVLoginResponse(checksum));
+      try {
+        const resend = await server.recv(500);
+        if (resend.length >= 24) server.write(this.msgAVLoginResponse(resend.readUInt32LE(20)));
+      } catch { /* no resend — fine */ }
+    }
+    this.log("[Wyze] intercom: ready for two-way audio");
+  }
+
+  /** Send one encoded audio frame to the camera (codec must match getBackchannelCodec). */
+  writeAudio(codec: number, payload: Buffer, timestampUS: number, sampleRate: number, channels: number): void {
+    if (!this.serverConn) throw new Error("intercom not started");
+    this.serverConn.write(this.msgAudioFrame(payload, timestampUS, codec, sampleRate, channels));
+  }
+
+  /** Tear down the backchannel and disable the return-audio channel. */
+  stopIntercom(): void {
+    if (this.serverConn) { this.serverConn.close(); this.serverConn = null; }
+    this.audioSeq = 0;
+    this.audioFrameNo = 0;
+    if (!this.closed) {
+      this.udpSend(this.msgTxData(this.dtlsWrite(23, this.msgIOCtrl(this.buildK10010(3, false))), 0)).catch(() => {});
+    }
+  }
+
+  /** True once the backchannel DTLS server is up. */
+  get isBackchannelReady(): boolean { return this.serverConn !== null; }
+
+  private msgAVLoginResponse(checksum: number): Buffer {
+    const b = Buffer.alloc(60);
+    b.writeUInt16LE(0x2100, 0); b.writeUInt16LE(0x000c, 2); b[4] = 0x10;
+    b.writeUInt32LE(0x24, 16); b.writeUInt32LE(checksum >>> 0, 20);
+    b[29] = 0x01; b[31] = 0x01;
+    b.writeUInt32LE(0x04, 36); b.writeUInt32LE(0x001f07fb, 40);
+    b.writeUInt16LE(0x0003, 54); b.writeUInt16LE(0x0002, 56);
+    return b;
+  }
+
+  private msgAudioFrame(payload: Buffer, timestampUS: number, codec: number, sampleRate: number, channels: number): Buffer {
+    this.audioSeq++;
+    this.audioFrameNo++;
+    const prevFrame = this.audioFrameNo > 1 ? this.audioFrameNo - 1 : 0;
+    const totalPayload = payload.length + 16;
+    const b = Buffer.alloc(36 + totalPayload);
+    // Outer header
+    b[0] = ChannelAudio; b[1] = FrameTypeStartAlt;
+    b.writeUInt16LE(0x000c, 2);
+    b.writeUInt32LE(this.audioSeq >>> 0, 4);
+    b.writeUInt32LE(timestampUS >>> 0, 8);
+    b.writeUInt32LE(this.audioFrameNo === 1 ? 0x00000001 : 0x00100001, 12);
+    // Inner header
+    b[16] = ChannelAudio; b[17] = FrameTypeEndSingle;
+    b.writeUInt16LE(prevFrame & 0xffff, 18);
+    b.writeUInt16LE(0x0001, 20);
+    b.writeUInt16LE(0x0010, 22);
+    b.writeUInt32LE(totalPayload >>> 0, 24);
+    b.writeUInt32LE(prevFrame >>> 0, 28);
+    b.writeUInt32LE(this.audioFrameNo >>> 0, 32);
+    payload.copy(b, 36);
+    // FrameInfo trailer (16 bytes)
+    const fi = b.subarray(36 + payload.length);
+    fi[0] = codec; fi[1] = 0;
+    const srIdx = getSampleRateIndex(sampleRate);
+    fi[2] = (srIdx << 2) | 0x02; // 16-bit always set
+    if (channels === 2) fi[2] |= 0x01;
+    fi[4] = 1; // online
+    const spf = getSamplesPerFrame(codec) || 1;
+    fi.writeUInt32LE(Math.floor((this.audioFrameNo - 1) * spf * 1000 / (sampleRate || 1)) >>> 0, 12);
+    return b;
+  }
+
   /** Set packet handler for decoded frames. */
   onPacket(handler: (pkt: Packet) => void): void {
-    this.frameHandler.setHandler(handler);
+    this.frameHandler.setHandler((pkt: Packet) => {
+      // Capture the camera's audio codec — it is also what the camera accepts
+      // for the return-audio (backchannel) stream.
+      if (isAudioCodec(pkt.codec)) {
+        this.audioCodecId = pkt.codec;
+        this.audioSampleRate = pkt.sampleRate || 8000;
+        this.audioChannels = pkt.channels || 1;
+      }
+      handler(pkt);
+    });
+  }
+
+  /** True if the camera advertised two-way streaming during AV login. */
+  get hasTwoWayStreaming(): boolean { return this.hasTwoWay; }
+
+  /** Audio codec the camera sent (= what it accepts back). 0 until first audio. */
+  getBackchannelCodec(): { codec: number; sampleRate: number; channels: number } {
+    return { codec: this.audioCodecId, sampleRate: this.audioSampleRate, channels: this.audioChannels };
   }
 
   // ─── Camera Commands (K10xxx via HL protocol) ─────────────────
@@ -759,6 +886,7 @@ export class WyzeDTLSConn extends EventEmitter {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.serverConn) { this.serverConn.close(); this.serverConn = null; }
     if (this.ackTicker) clearInterval(this.ackTicker);
     if (this.messageListener && this.socket) this.socket.removeListener("message", this.messageListener);
     this.frameHandler.close();
@@ -787,7 +915,7 @@ export class WyzeDTLSConn extends EventEmitter {
       const rx = setInterval(() => this.udpSend(this.msgTxData(chRec, 0)).catch(() => {}), 1000);
       const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
         if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const recs = this.decodeInbound(msg); if (!recs) return;
+        const dec = this.decodeInbound(msg); if (!dec || dec.channel !== 0) return; const recs = dec.records;
         {
           for (const r of parseAllRecords(recs)) { if (r.contentType !== 22 || r.epoch !== 0) continue;
             for (const h of parseHandshakeMsgs(r.fragment)) { if (!srvHS.has(h.msgSeq)) { srvHS.set(h.msgSeq, h); if (h.type === 14) { cl(); res(); } } } }
@@ -837,7 +965,7 @@ export class WyzeDTLSConn extends EventEmitter {
       const rx = setInterval(() => this.udpSend(this.msgTxData(flight2, 0)).catch(() => {}), 1500);
       const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
         if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const recs = this.decodeInbound(msg); if (!recs) return;
+        const dec = this.decodeInbound(msg); if (!dec || dec.channel !== 0) return; const recs = dec.records;
         {
           for (const r of parseAllRecords(recs)) {
             if (r.contentType === 22 && r.epoch === 1) { try { chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 22, r.fragment); cl(); res(); } catch {} }
@@ -866,7 +994,7 @@ export class WyzeDTLSConn extends EventEmitter {
       const t = setTimeout(() => { cl(); rej(new Error("AV Login timeout")); }, 8000);
       const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
         if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const recs = this.decodeInbound(msg); if (!recs) return;
+        const dec = this.decodeInbound(msg); if (!dec || dec.channel !== 0) return; const recs = dec.records;
         {
           for (const r of parseAllRecords(recs)) {
             if (r.contentType === 23 && r.epoch === 1) { try { const p = chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 23, r.fragment);
@@ -929,7 +1057,7 @@ export class WyzeDTLSConn extends EventEmitter {
       const rx = setInterval(() => this.udpSend(this.msgTxData(this.dtlsWrite(23, frame), 0)).catch(() => {}), 1000);
       const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
         if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const recs = this.decodeInbound(msg); if (!recs) return;
+        const dec = this.decodeInbound(msg); if (!dec || dec.channel !== 0) return; const recs = dec.records;
         {
           for (const r of parseAllRecords(recs)) { if (r.contentType === 23 && r.epoch === 1) {
             try { const p = chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 23, r.fragment); this.trackSeq(p);
@@ -967,8 +1095,11 @@ export class WyzeDTLSConn extends EventEmitter {
       if (ri.address !== this.host || this.closed) return;
       this.remotePort = ri.port;
       udpPackets++;
-      const recs = this.decodeInbound(msg);
-      if (!recs) { keepalives++; return; }
+      const dec = this.decodeInbound(msg);
+      if (!dec) { keepalives++; return; }
+      // Channel 1 = backchannel DTLS (two-way audio) — feed the DTLS server.
+      if (dec.channel === 1) { this.serverConn?.feed(dec.records); return; }
+      const recs = dec.records;
       for (const r of parseAllRecords(recs)) {
         if (r.contentType === 23 && r.epoch === 1) {
           dtlsRecords++;
@@ -1093,7 +1224,7 @@ export class WyzeDTLSConn extends EventEmitter {
    * across IOTC and CC51 transports, auto-replying to keepalives. Returns null
    * for keepalives / non-data / wrong-channel packets.
    */
-  private decodeInbound(msg: Buffer): Buffer | null {
+  private decodeInbound(msg: Buffer): { channel: number; records: Buffer } | null {
     if (this.isCC51) {
       if (msg.length < 12 || msg.subarray(0, 2).toString("binary") !== MAGIC_CC51) return null;
       const cmd = msg.readUInt16LE(4);
@@ -1103,8 +1234,7 @@ export class WyzeDTLSConn extends EventEmitter {
       }
       if (cmd === CMD_DTLS_CC51 && msg.length >= HEADER_SIZE_CC51 + AUTH_SIZE_CC51) {
         const ch = msg.readUInt16LE(12) >> 8;
-        if (ch !== 0) return null;
-        return msg.subarray(HEADER_SIZE_CC51, msg.length - AUTH_SIZE_CC51);
+        return { channel: ch, records: msg.subarray(HEADER_SIZE_CC51, msg.length - AUTH_SIZE_CC51) };
       }
       return null;
     }
@@ -1112,7 +1242,7 @@ export class WyzeDTLSConn extends EventEmitter {
     if (d.length < 16) return null;
     const cmd = d.readUInt16LE(8);
     if (cmd === 0x0428 && d.length > 24) { this.udpSend(this.msgKeepaliveAck(d)).catch(() => {}); return null; }
-    if (cmd === 0x0408 && d.length > 28 && d[14] === 0) return d.subarray(28);
+    if (cmd === 0x0408 && d.length > 28) return { channel: d[14]!, records: d.subarray(28) };
     return null;
   }
 

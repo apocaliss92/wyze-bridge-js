@@ -86,7 +86,7 @@ describe("CC51 transport alignment to go2rtc", () => {
     d[14] = 0; // channel 0
     records.copy(d, 28);
     const wire = transCodeBlob(d);
-    expect(c.decodeInbound(wire)).toEqual(records);
+    expect(c.decodeInbound(wire)).toEqual({ channel: 0, records });
 
     // CC51: build a 0x1502 frame with channel 0; raw on the wire.
     c.isCC51 = true;
@@ -96,7 +96,7 @@ describe("CC51 transport alignment to go2rtc", () => {
     frame.writeUInt16LE(0x1502, 4);
     frame.writeUInt16LE(0x0010 | (0 << 8), 12); // channel 0 high byte
     payload.copy(frame, 28);
-    expect(c.decodeInbound(frame)).toEqual(payload);
+    expect(c.decodeInbound(frame)).toEqual({ channel: 0, records: payload });
   });
 
   it("decodeInbound returns null for keepalives (no throw without a socket)", () => {
