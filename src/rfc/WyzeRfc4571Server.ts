@@ -464,6 +464,7 @@ export async function createWyzeRfc4571Server(
   let audioDetected = false;
   let audioWriter: RtpWriter | null = null;
   let audioCodecId = 0;
+  let audioDiagCount = 0;
   let closed = false;
 
   // ─── Stream health monitoring ──────────────────────────────
@@ -556,6 +557,28 @@ export async function createWyzeRfc4571Server(
         } else {
           logger.log?.(`[wyze-rfc4571] Unsupported audio codec: 0x${pkt.codec.toString(16)}`);
         }
+      }
+
+      // Diagnostic: measure the camera's PCM amplitude both ways for the first
+      // frames. Tells silence (both ~0) from signal, and which endianness is
+      // real audio (speech = low avg + moderate peak; wrong endianness = full-
+      // scale noise with avg in the thousands and peak ~32767).
+      if (audioDiagCount < 15 && audioCodecId === CodecPCML) {
+        audioDiagCount++;
+        const b = pkt.payload;
+        const n = Math.floor(b.length / 2);
+        let sumLE = 0, sumBE = 0, peakLE = 0, peakBE = 0;
+        for (let i = 0; i < n; i++) {
+          const le = Math.abs(b.readInt16LE(i * 2));
+          const be = Math.abs(b.readInt16BE(i * 2));
+          sumLE += le; sumBE += be;
+          if (le > peakLE) peakLE = le;
+          if (be > peakBE) peakBE = be;
+        }
+        logger.log?.(
+          `[wyze-audio] #${audioDiagCount} codec=0x${pkt.codec.toString(16)} len=${b.length} rate=${pkt.sampleRate} ch=${pkt.channels} | ` +
+          `LE avg=${(sumLE / (n || 1)).toFixed(0)} peak=${peakLE} | BE avg=${(sumBE / (n || 1)).toFixed(0)} peak=${peakBE}`,
+        );
       }
 
       if (!audioWriter || clients.size === 0) return;
