@@ -160,34 +160,42 @@ export class WyzeDTLSConn extends EventEmitter {
   async connect(): Promise<{ hasTwoWay: boolean; authInfo: any }> {
     this.socket = dgram.createSocket("udp4");
     await new Promise<void>(r => this.socket!.bind(0, r));
-    if (this.verbose) this.log(`[Wyze] UDP bound :${this.socket.address().port}`);
+    const localPort = this.socket.address().port;
+    // Unconditional handshake tracing (not gated by `verbose`) so plugin logs
+    // pinpoint exactly which P2P stage stalls. Each stage is numbered /6.
+    this.log(`[Wyze] connect → ${this.host}:${this.remotePort} udp:${localPort} model=${this.model} uid=${this.uid}`);
 
     // 1. IOTC Discovery
-    await this.writeAndWait(this.msgDisco(1), r => r.length >= 16 && r.readUInt16LE(8) === 0x0602);
-    if (this.verbose) this.log("[Wyze] Discovery OK");
+    this.log("[Wyze] 1/6 discovery…");
+    await this.writeAndWait(this.msgDisco(1), r => r.length >= 16 && r.readUInt16LE(8) === 0x0602, 5000, "discovery");
+    this.log("[Wyze] 1/6 discovery OK");
 
     // 2. Direct connect
     await this.udpSend(this.msgDisco(2));
     await this.sleep(200);
 
     // 3. Session
-    await this.writeAndWait(this.msgSession(), r => r.length >= 16 && r.readUInt16LE(8) === 0x0404);
-    if (this.verbose) this.log("[Wyze] Session OK");
+    this.log("[Wyze] 3/6 session…");
+    await this.writeAndWait(this.msgSession(), r => r.length >= 16 && r.readUInt16LE(8) === 0x0404, 5000, "session");
+    this.log("[Wyze] 3/6 session OK");
 
     // 4. DTLS Handshake
+    this.log("[Wyze] 4/6 dtls handshake…");
     await this.doDTLSHandshake();
-    if (this.verbose) this.log("[Wyze] DTLS OK");
+    this.log("[Wyze] 4/6 dtls OK");
 
     // 5. AV Login
+    this.log("[Wyze] 5/6 av login…");
     const hasTwoWay = await this.doAVLogin();
-    if (this.verbose) this.log(`[Wyze] AV Login OK (twoWay=${hasTwoWay})`);
+    this.log(`[Wyze] 5/6 av login OK (twoWay=${hasTwoWay})`);
 
     // Start periodic ACK
     this.ackTicker = setInterval(() => this.sendPeriodicAck(), 100);
 
     // 6. K-Auth
+    this.log("[Wyze] 6/6 k-auth…");
     const authInfo = await this.doKAuth();
-    if (this.verbose) this.log("[Wyze] K-Auth OK");
+    this.log("[Wyze] 6/6 k-auth OK — handshake complete");
 
     // Start frame listener
     this.startFrameListener();
@@ -941,11 +949,31 @@ export class WyzeDTLSConn extends EventEmitter {
     return new Promise((r, j) => { this.socket!.send(transCodeBlob(data), this.remotePort, this.host, e => e ? j(e) : r()); });
   }
 
-  private writeAndWait(data: Buffer, matchFn: (d: Buffer) => boolean, ms = 5000): Promise<Buffer> {
+  private writeAndWait(data: Buffer, matchFn: (d: Buffer) => boolean, ms = 5000, label = "handshake"): Promise<Buffer> {
     return new Promise((res, rej) => {
-      const dl = Date.now() + ms; const iv = setInterval(() => { if (Date.now() > dl) { cl(); rej(new Error("Timeout")); } this.udpSend(data).catch(() => {}); }, 1000);
-      const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => { if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const d = reverseTransCodeBlob(msg); if (matchFn(d)) { cl(); res(d); } };
+      // rxFromHost: any UDP seen from the camera IP (reachability signal).
+      // rxUnmatched: packets that arrived but did not match the expected
+      // reply (protocol/firmware signal). These two counters let a single
+      // failed log distinguish "camera never answered" from "answered but
+      // the reply shape was unexpected".
+      let rxFromHost = 0; let rxUnmatched = 0; let firstReplyLogged = false;
+      const dl = Date.now() + ms;
+      const iv = setInterval(() => {
+        if (Date.now() > dl) {
+          cl();
+          rej(new Error(`${label} timeout after ${ms}ms — rxFromCamera=${rxFromHost} unmatched=${rxUnmatched} (target=${this.host}:${this.remotePort})`));
+          return;
+        }
+        this.udpSend(data).catch(() => {});
+      }, 1000);
+      const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
+        if (ri.address !== this.host) return;
+        this.remotePort = ri.port;
+        rxFromHost++;
+        if (!firstReplyLogged) { firstReplyLogged = true; this.log(`[Wyze] ${label}: first UDP reply from ${ri.address}:${ri.port} (${msg.length}B)`); }
+        const d = reverseTransCodeBlob(msg);
+        if (matchFn(d)) { cl(); res(d); } else { rxUnmatched++; }
+      };
       const cl = () => { clearInterval(iv); this.socket!.removeListener("message", onMsg); };
       this.socket!.on("message", onMsg); this.udpSend(data).catch(() => {});
     });
