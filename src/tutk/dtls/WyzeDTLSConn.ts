@@ -12,6 +12,22 @@ import { calculateAuthKey, derivePSK } from "./auth.js";
 import { FrameHandler, type Packet, ChannelAudio, ChannelIVideo, ChannelPVideo } from "../frame.js";
 import { isVideoCodec, isAudioCodec } from "../codec.js";
 
+// ─── CC51 transport variant ─────────────────────────────────────
+// Some Wyze firmwares answer discovery with the "CC51" protocol instead of
+// the IOTC "Basis" protocol. CC51 frames are sent raw (no TransCode blob),
+// carry a per-session HMAC trailer, and wrap the same DTLS records.
+// Ported from go2rtc pkg/tutk/dtls/conn_dtls.go.
+const MAGIC_CC51 = "\x51\xcc";
+const SDK_VERSION_43 = Buffer.from([0x00, 0x08, 0x03, 0x04]); // 4.3.8.0
+const CMD_DISCO_CC51 = 0x1002;
+const CMD_KEEPALIVE_CC51 = 0x1202;
+const CMD_DTLS_CC51 = 0x1502;
+const PAYLOAD_SIZE_CC51 = 0x0028;
+const PACKET_SIZE_CC51 = 52;
+const HEADER_SIZE_CC51 = 28;
+const AUTH_SIZE_CC51 = 20;
+const KEEPALIVE_SIZE_CC51 = 48;
+
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface WyzeDTLSConnOptions {
@@ -122,6 +138,11 @@ export class WyzeDTLSConn extends EventEmitter {
   private seqCmd = 0;
   private txSeq = 0;
 
+  // CC51 transport state (set during discovery)
+  private isCC51 = false;
+  private ticket = 0;
+  private kaSeq = 0;
+
   // Periodic ACK
   private ackFlags = 0;
   private ackAvSeq = 0;
@@ -165,19 +186,12 @@ export class WyzeDTLSConn extends EventEmitter {
     // pinpoint exactly which P2P stage stalls. Each stage is numbered /6.
     this.log(`[Wyze] connect → ${this.host}:${this.remotePort} udp:${localPort} model=${this.model} uid=${this.uid}`);
 
-    // 1. IOTC Discovery
+    // 1-3. Discovery — dual-probe IOTC + CC51, adopt whichever the camera
+    // answers. CC51 cameras never reply to the IOTC probe alone, which stalled
+    // here before (issue #4).
     this.log("[Wyze] 1/6 discovery…");
-    await this.writeAndWait(this.msgDisco(1), r => r.length >= 16 && r.readUInt16LE(8) === 0x0602, 5000, "discovery");
-    this.log("[Wyze] 1/6 discovery OK");
-
-    // 2. Direct connect
-    await this.udpSend(this.msgDisco(2));
-    await this.sleep(200);
-
-    // 3. Session
-    this.log("[Wyze] 3/6 session…");
-    await this.writeAndWait(this.msgSession(), r => r.length >= 16 && r.readUInt16LE(8) === 0x0404, 5000, "session");
-    this.log("[Wyze] 3/6 session OK");
+    await this.discover();
+    this.log(`[Wyze] 1/6 discovery OK (protocol=${this.isCC51 ? "CC51" : "IOTC"})`);
 
     // 4. DTLS Handshake
     this.log("[Wyze] 4/6 dtls handshake…");
@@ -203,11 +217,107 @@ export class WyzeDTLSConn extends EventEmitter {
     return { hasTwoWay, authInfo };
   }
 
+  /**
+   * Discovery with dual-probe: send the IOTC and the CC51 disco packets and
+   * adopt whichever protocol the camera answers (ported from go2rtc
+   * conn_dtls.go `discovery()`).
+   */
+  private async discover(): Promise<void> {
+    const pktIOTC = transCodeBlob(this.msgDisco(1));
+    const pktCC51 = this.msgDiscoCC51(0, 0, false);
+    let rxFromCamera = 0;
+    let unmatched = 0;
+
+    await new Promise<void>((resolve, reject) => {
+      const dl = Date.now() + 5000;
+      const tick = () => {
+        if (Date.now() > dl) {
+          cl();
+          reject(new Error(`discovery timeout after 5000ms — rxFromCamera=${rxFromCamera} unmatched=${unmatched} (target=${this.host}:${this.remotePort})`));
+          return;
+        }
+        this.udpSendRaw(pktIOTC).catch(() => {});
+        this.udpSendRaw(pktCC51).catch(() => {});
+      };
+      const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
+        if (ri.address !== this.host) return;
+        rxFromCamera++;
+        // CC51 reply?
+        if (
+          msg.length >= PACKET_SIZE_CC51 &&
+          msg.subarray(0, 2).toString("binary") === MAGIC_CC51 &&
+          msg.readUInt16LE(4) === CMD_DISCO_CC51
+        ) {
+          this.remotePort = ri.port;
+          this.isCC51 = true;
+          this.ticket = msg.readUInt16LE(14);
+          if (msg.length >= 24) msg.copy(this.sid, 0, 16, 24);
+          cl();
+          this.log(`[Wyze] discovery: CC51 protocol (ticket=${this.ticket})`);
+          this.discoDoneCC51().then(resolve).catch(reject);
+          return;
+        }
+        // IOTC reply?
+        const d = reverseTransCodeBlob(msg);
+        if (d.length >= 16 && d.readUInt16LE(8) === 0x0602) {
+          this.remotePort = ri.port;
+          this.isCC51 = false;
+          cl();
+          this.log("[Wyze] discovery: IOTC protocol");
+          this.discoDoneIOTC().then(resolve).catch(reject);
+          return;
+        }
+        unmatched++;
+      };
+      const iv = setInterval(tick, 1000);
+      const cl = () => { clearInterval(iv); this.socket!.removeListener("message", onMsg); };
+      this.socket!.on("message", onMsg);
+      tick();
+    });
+  }
+
+  /** IOTC discovery stage 2 + session negotiation. */
+  private async discoDoneIOTC(): Promise<void> {
+    await this.udpSend(this.msgDisco(2));
+    await this.sleep(200);
+    this.log("[Wyze] 3/6 session…");
+    await this.writeAndWait(this.msgSession(), r => r.length >= 16 && r.readUInt16LE(8) === 0x0404, 5000, "session");
+    this.log("[Wyze] 3/6 session OK");
+  }
+
+  /** CC51 discovery stage 2 (no IOTC session step). */
+  private async discoDoneCC51(): Promise<void> {
+    const req = this.msgDiscoCC51(2, this.ticket, false);
+    await new Promise<void>((resolve, reject) => {
+      const dl = Date.now() + 5000;
+      const tick = () => {
+        if (Date.now() > dl) { cl(); reject(new Error("CC51 disco stage-2 timeout")); return; }
+        this.udpSendRaw(req).catch(() => {});
+      };
+      const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
+        if (ri.address !== this.host) return;
+        if (msg.length < PACKET_SIZE_CC51 || msg.subarray(0, 2).toString("binary") !== MAGIC_CC51) return;
+        if (msg.readUInt16LE(4) === CMD_DISCO_CC51 && msg.readUInt16LE(8) === 0xffff && msg.readUInt16LE(12) === 3) {
+          this.remotePort = ri.port;
+          cl();
+          resolve();
+        }
+      };
+      const iv = setInterval(tick, 1000);
+      const cl = () => { clearInterval(iv); this.socket!.removeListener("message", onMsg); };
+      this.socket!.on("message", onMsg);
+      tick();
+    });
+  }
+
   /** Start video streaming. Returns when K10010 response is received. */
   async startVideo(frameSize = 0, bitrate = 0xF0): Promise<void> {
-    // Set resolution
-    const k10056 = this.buildHL(10056, Buffer.from([frameSize + 1, bitrate & 0xff, (bitrate >> 8) & 0xff, 0, 0]));
-    await this.udpSend(this.msgTxData(this.dtlsWrite(23, this.msgIOCtrl(k10056)), 0));
+    // Set resolution — doorbell-class models use K10052, others K10056
+    // (ported from go2rtc Client.SetResolution / useDoorbellResolution).
+    const resHL = this.useDoorbellResolution()
+      ? this.buildHL(10052, Buffer.from([bitrate & 0xff, (bitrate >> 8) & 0xff, frameSize + 1, 0, 0, 0]))
+      : this.buildHL(10056, Buffer.from([frameSize + 1, bitrate & 0xff, (bitrate >> 8) & 0xff, 0, 0]));
+    await this.udpSend(this.msgTxData(this.dtlsWrite(23, this.msgIOCtrl(resHL)), 0));
     await this.sleep(200);
     // Start video channel
     const k10010 = this.buildK10010(1, true);
@@ -677,10 +787,9 @@ export class WyzeDTLSConn extends EventEmitter {
       const rx = setInterval(() => this.udpSend(this.msgTxData(chRec, 0)).catch(() => {}), 1000);
       const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
         if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const d = reverseTransCodeBlob(msg); if (d.length < 16) return;
-        if (d.readUInt16LE(8) === 0x0428 && d.length > 24) { this.udpSend(this.msgKeepaliveAck(d)).catch(() => {}); return; }
-        if (d.readUInt16LE(8) === 0x0408 && d.length > 28 && d[14] === 0) {
-          for (const r of parseAllRecords(d.subarray(28))) { if (r.contentType !== 22 || r.epoch !== 0) continue;
+        const recs = this.decodeInbound(msg); if (!recs) return;
+        {
+          for (const r of parseAllRecords(recs)) { if (r.contentType !== 22 || r.epoch !== 0) continue;
             for (const h of parseHandshakeMsgs(r.fragment)) { if (!srvHS.has(h.msgSeq)) { srvHS.set(h.msgSeq, h); if (h.type === 14) { cl(); res(); } } } }
         }
       };
@@ -728,10 +837,9 @@ export class WyzeDTLSConn extends EventEmitter {
       const rx = setInterval(() => this.udpSend(this.msgTxData(flight2, 0)).catch(() => {}), 1500);
       const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
         if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const d = reverseTransCodeBlob(msg); if (d.length < 16) return;
-        if (d.readUInt16LE(8) === 0x0428 && d.length > 24) { this.udpSend(this.msgKeepaliveAck(d)).catch(() => {}); return; }
-        if (d.readUInt16LE(8) === 0x0408 && d.length > 28 && d[14] === 0) {
-          for (const r of parseAllRecords(d.subarray(28))) {
+        const recs = this.decodeInbound(msg); if (!recs) return;
+        {
+          for (const r of parseAllRecords(recs)) {
             if (r.contentType === 22 && r.epoch === 1) { try { chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 22, r.fragment); cl(); res(); } catch {} }
           }
         }
@@ -758,10 +866,9 @@ export class WyzeDTLSConn extends EventEmitter {
       const t = setTimeout(() => { cl(); rej(new Error("AV Login timeout")); }, 8000);
       const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
         if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const d = reverseTransCodeBlob(msg); if (d.length < 16) return;
-        if (d.readUInt16LE(8) === 0x0428 && d.length > 24) { this.udpSend(this.msgKeepaliveAck(d)).catch(() => {}); return; }
-        if (d.readUInt16LE(8) === 0x0408 && d.length > 28 && d[14] === 0) {
-          for (const r of parseAllRecords(d.subarray(28))) {
+        const recs = this.decodeInbound(msg); if (!recs) return;
+        {
+          for (const r of parseAllRecords(recs)) {
             if (r.contentType === 23 && r.epoch === 1) { try { const p = chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 23, r.fragment);
               if (p.readUInt16LE(0) === 0x2100) { const ack = Buffer.alloc(24); ack.writeUInt16LE(0x0009, 0); ack.writeUInt16LE(0x000c, 2);
                 this.udpSend(this.msgTxData(this.dtlsWrite(23, ack), 0)).catch(() => {}); cl(); res(p.length >= 32 && p[31] === 1); }
@@ -822,10 +929,9 @@ export class WyzeDTLSConn extends EventEmitter {
       const rx = setInterval(() => this.udpSend(this.msgTxData(this.dtlsWrite(23, frame), 0)).catch(() => {}), 1000);
       const onMsg = (msg: Buffer, ri: dgram.RemoteInfo) => {
         if (ri.address !== this.host) return; this.remotePort = ri.port;
-        const d = reverseTransCodeBlob(msg); if (d.length < 16) return;
-        if (d.readUInt16LE(8) === 0x0428 && d.length > 24) { this.udpSend(this.msgKeepaliveAck(d)).catch(() => {}); return; }
-        if (d.readUInt16LE(8) === 0x0408 && d.length > 28 && d[14] === 0) {
-          for (const r of parseAllRecords(d.subarray(28))) { if (r.contentType === 23 && r.epoch === 1) {
+        const recs = this.decodeInbound(msg); if (!recs) return;
+        {
+          for (const r of parseAllRecords(recs)) { if (r.contentType === 23 && r.epoch === 1) {
             try { const p = chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 23, r.fragment); this.trackSeq(p);
               const hl = findHL(p, 32) ?? findHL(p, 36) ?? findHL(p, 0);
               if (hl) { const [cid, pl, ok] = parseHL(hl); if (ok && cid === expectCmd) { cl(); res(pl); } }
@@ -861,31 +967,21 @@ export class WyzeDTLSConn extends EventEmitter {
       if (ri.address !== this.host || this.closed) return;
       this.remotePort = ri.port;
       udpPackets++;
-      const decoded = reverseTransCodeBlob(msg);
-      if (decoded.length < 16) return;
-      const cmd = decoded.readUInt16LE(8);
-
-      if (cmd === 0x0428 && decoded.length > 24) {
-        keepalives++;
-        this.udpSend(this.msgKeepaliveAck(decoded)).catch(() => {});
-        return;
-      }
-
-      if (cmd === 0x0408 && decoded.length > 28 && decoded[14] === 0) {
-        for (const r of parseAllRecords(decoded.subarray(28))) {
-          if (r.contentType === 23 && r.epoch === 1) {
-            dtlsRecords++;
-            try {
-              const plain = chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 23, r.fragment);
-              this.trackSeq(plain);
-              const ch = plain[0]!;
-              if (ch === ChannelIVideo || ch === ChannelPVideo || ch === ChannelAudio) {
-                frameData++;
-                this.frameHandler.handle(plain);
-              }
-            } catch {
-              decryptErrors++;
+      const recs = this.decodeInbound(msg);
+      if (!recs) { keepalives++; return; }
+      for (const r of parseAllRecords(recs)) {
+        if (r.contentType === 23 && r.epoch === 1) {
+          dtlsRecords++;
+          try {
+            const plain = chacha20Decrypt(this.serverWriteKey, this.serverWriteIV, 1, r.seqNum, 23, r.fragment);
+            this.trackSeq(plain);
+            const ch = plain[0]!;
+            if (ch === ChannelIVideo || ch === ChannelPVideo || ch === ChannelAudio) {
+              frameData++;
+              this.frameHandler.handle(plain);
             }
+          } catch {
+            decryptErrors++;
           }
         }
       }
@@ -929,12 +1025,95 @@ export class WyzeDTLSConn extends EventEmitter {
   }
 
   private msgTxData(payload: Buffer, ch: number): Buffer {
+    // CC51 transport wraps the DTLS record differently (raw + HMAC trailer).
+    if (this.isCC51) return this.msgTxDataCC51(payload, ch);
     const bs = 12 + payload.length; const b = Buffer.alloc(16 + bs);
     b[0] = 0x04; b[1] = 0x02; b[2] = 0x1a; b[3] = 0x0b;
     b.writeUInt16LE(bs, 4); b.writeUInt16LE(this.txSeq, 6); this.txSeq++;
     b.writeUInt16LE(0x0407, 8); b.writeUInt16LE(0x0021, 10);
     this.sid.copy(b, 12, 0, 2); b[14] = ch; b[15] = 0x01;
     b.writeUInt32LE(0x0c, 16); this.sid.copy(b, 20, 0, 8); payload.copy(b, 28); return b;
+  }
+
+  // ─── CC51 message builders (ported from go2rtc conn_dtls.go) ──────
+  private msgDiscoCC51(seq: number, ticket: number, isResponse: boolean): Buffer {
+    const b = Buffer.alloc(PACKET_SIZE_CC51);
+    b[0] = 0x51; b[1] = 0xcc;
+    b.writeUInt16LE(CMD_DISCO_CC51, 4);
+    b.writeUInt16LE(PAYLOAD_SIZE_CC51, 6);
+    if (isResponse) b.writeUInt16LE(0xffff, 8);
+    b.writeUInt16LE(seq, 12);
+    b.writeUInt16LE(ticket, 14);
+    this.sid.copy(b, 16, 0, 8);
+    SDK_VERSION_43.copy(b, 24);
+    b[28] = 0x1d;
+    const key = Buffer.concat([Buffer.from(this.uid, "ascii"), Buffer.from(this.authKey, "ascii")]);
+    createHmac("sha1", key).update(b.subarray(0, 32)).digest().copy(b, 32);
+    return b;
+  }
+
+  private msgKeepaliveCC51(): Buffer {
+    this.kaSeq += 2;
+    const b = Buffer.alloc(KEEPALIVE_SIZE_CC51);
+    b[0] = 0x51; b[1] = 0xcc;
+    b.writeUInt16LE(CMD_KEEPALIVE_CC51, 4);
+    b.writeUInt16LE(0x0024, 6);
+    b.writeUInt32LE(this.kaSeq, 16);
+    this.sid.copy(b, 20, 0, 8);
+    const key = Buffer.concat([Buffer.from(this.uid, "ascii"), Buffer.from(this.authKey, "ascii")]);
+    createHmac("sha1", key).update(b.subarray(0, 28)).digest().copy(b, 28);
+    return b;
+  }
+
+  private msgTxDataCC51(payload: Buffer, channel: number): Buffer {
+    const payloadSize = 16 + payload.length + AUTH_SIZE_CC51;
+    const b = Buffer.alloc(HEADER_SIZE_CC51 + payload.length + AUTH_SIZE_CC51);
+    b[0] = 0x51; b[1] = 0xcc;
+    b.writeUInt16LE(CMD_DTLS_CC51, 4);
+    b.writeUInt16LE(payloadSize, 6);
+    b.writeUInt16LE(0x0010 | (channel << 8), 12);
+    b.writeUInt16LE(this.ticket, 14);
+    this.sid.copy(b, 16, 0, 8);
+    b.writeUInt32LE(1, 24);
+    payload.copy(b, HEADER_SIZE_CC51);
+    const key = Buffer.concat([Buffer.from(this.uid, "ascii"), Buffer.from(this.authKey, "ascii")]);
+    createHmac("sha1", key).update(b.subarray(0, HEADER_SIZE_CC51)).digest().copy(b, HEADER_SIZE_CC51 + payload.length);
+    return b;
+  }
+
+  private useDoorbellResolution(): boolean {
+    switch (this.model) {
+      case "WYZEDB3": case "WVOD1": case "HL_WCO2": case "WYZEC1": return true;
+    }
+    return false;
+  }
+
+  /**
+   * Decode an inbound UDP datagram into its DTLS-record bytes, transparently
+   * across IOTC and CC51 transports, auto-replying to keepalives. Returns null
+   * for keepalives / non-data / wrong-channel packets.
+   */
+  private decodeInbound(msg: Buffer): Buffer | null {
+    if (this.isCC51) {
+      if (msg.length < 12 || msg.subarray(0, 2).toString("binary") !== MAGIC_CC51) return null;
+      const cmd = msg.readUInt16LE(4);
+      if (cmd === CMD_KEEPALIVE_CC51) {
+        if (msg.length >= KEEPALIVE_SIZE_CC51) this.udpSendRaw(this.msgKeepaliveCC51()).catch(() => {});
+        return null;
+      }
+      if (cmd === CMD_DTLS_CC51 && msg.length >= HEADER_SIZE_CC51 + AUTH_SIZE_CC51) {
+        const ch = msg.readUInt16LE(12) >> 8;
+        if (ch !== 0) return null;
+        return msg.subarray(HEADER_SIZE_CC51, msg.length - AUTH_SIZE_CC51);
+      }
+      return null;
+    }
+    const d = reverseTransCodeBlob(msg);
+    if (d.length < 16) return null;
+    const cmd = d.readUInt16LE(8);
+    if (cmd === 0x0428 && d.length > 24) { this.udpSend(this.msgKeepaliveAck(d)).catch(() => {}); return null; }
+    if (cmd === 0x0408 && d.length > 28 && d[14] === 0) return d.subarray(28);
+    return null;
   }
 
   private msgKeepaliveAck(inc: Buffer): Buffer {
@@ -946,7 +1125,12 @@ export class WyzeDTLSConn extends EventEmitter {
   // ─── Low-level helpers ────────────────────────────────────────
 
   private udpSend(data: Buffer): Promise<void> {
-    return new Promise((r, j) => { this.socket!.send(transCodeBlob(data), this.remotePort, this.host, e => e ? j(e) : r()); });
+    // IOTC frames are TransCode-obfuscated; CC51 frames go raw on the wire.
+    return this.isCC51 ? this.udpSendRaw(data) : this.udpSendRaw(transCodeBlob(data));
+  }
+
+  private udpSendRaw(data: Buffer): Promise<void> {
+    return new Promise((r, j) => { this.socket!.send(data, this.remotePort, this.host, e => e ? j(e) : r()); });
   }
 
   private writeAndWait(data: Buffer, matchFn: (d: Buffer) => boolean, ms = 5000, label = "handshake"): Promise<Buffer> {
