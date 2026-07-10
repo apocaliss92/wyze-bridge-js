@@ -485,11 +485,20 @@ export async function createWyzeRfc4571Server(
   });
 
   logger.log?.(`[wyze-rfc4571] Connecting to ${camera.nickname} (${camera.ip})...`);
-  await conn.connect();
-  logger.log?.(`[wyze-rfc4571] Connected, starting video...`);
+  // If any of connect / startVideo / startAudio throws (e.g. a P2P discovery
+  // timeout on an unreachable camera), close the conn so its bound UDP socket
+  // isn't orphaned. Without this, every 5s retry from the consumer leaks a
+  // handle — the root of issue #6, exposed by the timeouts in issue #4.
+  try {
+    await conn.connect();
+    logger.log?.(`[wyze-rfc4571] Connected, starting video...`);
 
-  await conn.startVideo(frameSize, bitrate);
-  await conn.startAudio();
+    await conn.startVideo(frameSize, bitrate);
+    await conn.startAudio();
+  } catch (e) {
+    try { conn.close(); } catch {}
+    throw e;
+  }
 
   const rebuildSdp = () => {
     if (videoSdpPart) {
@@ -674,7 +683,10 @@ export async function createWyzeRfc4571Server(
   return {
     host: addr.address,
     port: addr.port,
-    sdp,
+    // Getter, not a snapshot: rebuildSdp() reassigns `sdp` when the audio
+    // m-line is detected after this function returns. A primitive copy would
+    // strand the consumer with the audio-less SDP (silent-audio bug).
+    get sdp() { return sdp; },
     videoType,
     connection: conn,
     close: closeFn,

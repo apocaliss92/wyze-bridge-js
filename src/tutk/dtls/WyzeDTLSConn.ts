@@ -165,6 +165,7 @@ export class WyzeDTLSConn extends EventEmitter {
   private frameHandler: FrameHandler;
   private closed = false;
   private messageListener: ((msg: Buffer, rinfo: dgram.RemoteInfo) => void) | null = null;
+  private statsTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: WyzeDTLSConnOptions) {
     super();
@@ -189,6 +190,18 @@ export class WyzeDTLSConn extends EventEmitter {
    * After this, call startVideo()/startAudio() to begin streaming.
    */
   async connect(): Promise<{ hasTwoWay: boolean; authInfo: any }> {
+    try {
+      return await this.doConnect();
+    } catch (err) {
+      // Any handshake-stage timeout/failure must release the bound UDP socket
+      // and timers, otherwise a retrying consumer (every ~5s) leaks a native
+      // handle + this instance on every attempt (issues #4 and #6).
+      this.close();
+      throw err;
+    }
+  }
+
+  private async doConnect(): Promise<{ hasTwoWay: boolean; authInfo: any }> {
     this.socket = dgram.createSocket("udp4");
     await new Promise<void>(r => this.socket!.bind(0, r));
     const localPort = this.socket.address().port;
@@ -888,6 +901,7 @@ export class WyzeDTLSConn extends EventEmitter {
     this.closed = true;
     if (this.serverConn) { this.serverConn.close(); this.serverConn = null; }
     if (this.ackTicker) clearInterval(this.ackTicker);
+    if (this.statsTimer) { clearInterval(this.statsTimer); this.statsTimer = null; }
     if (this.messageListener && this.socket) this.socket.removeListener("message", this.messageListener);
     this.frameHandler.close();
     if (this.socket) { try { this.socket.close(); } catch {} this.socket = null; }
@@ -1081,9 +1095,12 @@ export class WyzeDTLSConn extends EventEmitter {
     let keepalives = 0;
     const startedAt = Date.now();
 
-    // Periodic stats log (every 30s)
-    const statsTimer = setInterval(() => {
-      if (this.closed) { clearInterval(statsTimer); return; }
+    // Periodic stats log (every 30s). Stored on `this` so close() can clear it
+    // immediately — a local const would keep the interval (and the whole conn
+    // closure) alive for up to 30s after teardown, delaying GC under reconnect
+    // churn (issue #6).
+    this.statsTimer = setInterval(() => {
+      if (this.closed) { if (this.statsTimer) { clearInterval(this.statsTimer); this.statsTimer = null; } return; }
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(0);
       this.log(
         `[Wyze-P2P] stats: ${elapsed}s elapsed  udp=${udpPackets} dtls=${dtlsRecords} ` +

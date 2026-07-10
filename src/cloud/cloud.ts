@@ -133,13 +133,16 @@ export class WyzeCloud {
   constructor(apiKeyOrOpts: string | WyzeCloudOptions, apiId?: string) {
     if (typeof apiKeyOrOpts === "string") {
       // Legacy constructor: WyzeCloud(apiKey, apiId)
-      this.apiKey = apiKeyOrOpts;
-      this.keyId = apiId!;
+      // Trim key material: a trailing space/newline pasted with a 60-char
+      // API key is a legal HTTP header value, so Wyze receives it verbatim
+      // and rejects login with errorCode 1000 (issue #7).
+      this.apiKey = apiKeyOrOpts.trim();
+      this.keyId = (apiId ?? "").trim();
       this.phoneId = generatePhoneId();
     } else {
       // New constructor: WyzeCloud(options)
-      this.apiKey = apiKeyOrOpts.apiKey;
-      this.keyId = apiKeyOrOpts.apiId;
+      this.apiKey = apiKeyOrOpts.apiKey.trim();
+      this.keyId = apiKeyOrOpts.apiId.trim();
       this.loadSession = apiKeyOrOpts.loadSession;
       this.saveSession = apiKeyOrOpts.saveSession;
       this.clearSession = apiKeyOrOpts.clearSession;
@@ -166,6 +169,11 @@ export class WyzeCloud {
    * @throws WyzeAuthError if MFA is required
    */
   async login(email: string, password: string): Promise<void> {
+    // Fail fast with an actionable error instead of letting Wyze return the
+    // opaque errorCode 1000 ("Invalid credentials … keyid or apikey").
+    if (!this.apiKey || !this.keyId) {
+      throw new Error("Wyze login: missing API key or key id");
+    }
     const payload = {
       email: email.trim(),
       password: hashPassword(password),
