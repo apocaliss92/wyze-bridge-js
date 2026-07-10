@@ -1,6 +1,6 @@
 {
   "name": "@apocaliss92/wyze-bridge-js",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Wyze camera local P2P streaming bridge — Node.js port of go2rtc/pkg/wyze",
   "type": "module",
   "main": "dist/index.js",
